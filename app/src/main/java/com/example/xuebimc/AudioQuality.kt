@@ -45,9 +45,12 @@ val Track.audioQuality: AudioQuality
     get() {
         // Positive badges need a probed codec/header. A scan MIME or a CDN .flac suffix alone
         // is not confirmation; ordinary formats can still be described without a badge.
-        val codec = normalizedAudioMime(codecMimeType) ?: normalizedAudioMime(mimeType)?.takeIf {
-            isLossyAudioCodec(it)
-        }
+        // MediaExtractor reports the decoder's output as audio/raw for many lossy files.
+        // That is not evidence about the source container and must never grant a badge.
+        // Prefer a real encoded codec/header; otherwise use the file/container MIME.
+        val probedCodec = normalizedAudioMime(codecMimeType)
+            ?.takeUnless { isPcmAudioCodec(it) }
+        val codec = probedCodec ?: normalizedAudioMime(mimeType)
         val lossless = isLosslessAudioCodec(codec)
         val rate = sampleRate.coerceAtLeast(0)
         val level = when {
@@ -77,7 +80,8 @@ internal fun isPcmAudioCodec(mime: String?): Boolean = when (normalizedAudioMime
 }
 
 internal fun isLosslessAudioCodec(mime: String?): Boolean = when (normalizedAudioMime(mime)) {
-    "audio/flac", "audio/x-flac", "audio/alac", "audio/x-alac", "audio/ape", "audio/x-ape", "audio/monkeys-audio" -> true
+    "audio/flac", "audio/x-flac", "audio/alac", "audio/x-alac", "audio/ape", "audio/x-ape", "audio/monkeys-audio",
+    "audio/wav", "audio/x-wav", "audio/wave" -> true
     else -> isPcmAudioCodec(mime) || isDsdAudioCodec(mime)
 }
 
@@ -99,6 +103,7 @@ private fun audioCodecLabel(mime: String?): String = when (mime) {
     "audio/dsf", "audio/x-dsf" -> "DSF"
     "audio/dff", "audio/x-dff", "audio/dsdiff" -> "DFF"
     "audio/dsd" -> "DSD"
+    "audio/wav", "audio/x-wav", "audio/wave", "audio/raw" -> "WAV"
     "audio/mp4a-latm", "audio/aac", "audio/aac-adts", "audio/x-aac" -> "AAC"
     "audio/mpeg", "audio/mp3" -> "MP3"
     "audio/mpeg-l2" -> "MP2"

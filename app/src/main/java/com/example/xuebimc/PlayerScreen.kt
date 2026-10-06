@@ -272,7 +272,9 @@ fun PlayerScreen(
             ).then(if (queueVisible) Modifier.clearAndSetSemantics { } else Modifier),
             requestSize = 512,
         )
-        val titleWidth = pageWidth * .655f
+        // Keep the title clear of the favourite / more controls during the compact transition.
+        // Long titles still marquee; they must never run underneath a tappable button.
+        val titleWidth = pageWidth * .59f
         val baseTitleSize = if (PlayerTypography.isChinese(title)) 18.5f else 20.5f
         val titleFamily = PlayerTypography.familyFor(title, medium = true)
         val titleStyle = TextStyle(

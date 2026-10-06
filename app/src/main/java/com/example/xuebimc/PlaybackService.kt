@@ -45,7 +45,16 @@ class PlaybackService : Service() {
     private var artworkKey: String? = null
     private var artwork: android.graphics.Bitmap? = null
     private val repository by lazy { LocalMusicRepository(applicationContext) }
-    private val observer: () -> Unit = { refresh() }
+    // Keep notification/Binder work out of the transport click / decoder callback stack.
+    // Several state changes during one switch need only one publication of the latest state.
+    private val refreshTask = Runnable { refresh() }
+    private val observer: () -> Unit = { scheduleRefresh() }
+
+    private fun scheduleRefresh() {
+        if (stopping) return
+        handler.removeCallbacks(refreshTask)
+        handler.post(refreshTask)
+    }
 
     private val idleStop = Runnable {
         idleStopScheduled = false
@@ -162,7 +171,7 @@ class PlaybackService : Service() {
                 if (event != null) session.controller.dispatchMediaButtonEvent(event)
             }
         }
-        refresh()
+        scheduleRefresh()
         return START_NOT_STICKY
     }
 
@@ -218,7 +227,7 @@ class PlaybackService : Service() {
             if (stopping || artworkKey != track.stableKey) return@launch
             artwork = bitmap
             publishedTrack = null // republish metadata with the cover
-            refresh()
+            scheduleRefresh()
         }
     }
 

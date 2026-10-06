@@ -192,7 +192,10 @@ class LocalMusicRepository(context: Context) {
                 genre = value(MediaMetadataRetriever.METADATA_KEY_GENRE) ?: track.genre,
                 durationMs = value(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
                     ?.takeIf { it > 0 } ?: track.durationMs,
-                mimeType = value(MediaMetadataRetriever.METADATA_KEY_MIMETYPE) ?: track.mimeType,
+                // Some vendor retrievers report the decoded PCM output (audio/raw) here.
+                // Keep the MediaStore/container MIME so a lossy file cannot become “lossless”.
+                mimeType = value(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
+                    ?.takeUnless { isPcmAudioCodec(it) } ?: track.mimeType,
                 bitrate = value(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull()
                     ?.takeIf { it > 0L } ?: track.bitrate,
                 sampleRate = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
