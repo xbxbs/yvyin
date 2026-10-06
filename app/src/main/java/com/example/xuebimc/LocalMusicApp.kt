@@ -126,6 +126,7 @@ internal fun LocalMusicApp(
     var controlsVisible by remember { mutableStateOf(true) }
     var interactionRevision by remember { mutableIntStateOf(0) }
     val currentTrack = playback.currentTrack
+    val listeningStats by playback.listeningStats.snapshot.collectAsState()
     fun selectTab(tab: MusicTab) {
         focus.clearFocus()
         keyboard?.hide()
@@ -413,7 +414,10 @@ internal fun LocalMusicApp(
     var barHeight by remember { mutableStateOf(0.dp) }
     val recordLibraryBackdrop = !playerCovered
 
-    CompositionLocalProvider(LocalAnimatedBackground provides true) {
+    CompositionLocalProvider(
+        LocalAnimatedBackground provides appPreferenceValues.animatedBackground,
+        LocalLiquidGlass provides appPreferenceValues.liquidGlass,
+    ) {
     SharedArtworkTransition(
         playerExpansion = playerExpansion,
         enabled = !lyricsVisible && !queueVisible && sheet == null && !playlistAddVisible &&
@@ -439,6 +443,7 @@ internal fun LocalMusicApp(
         }) {
             LibraryScreen(
                 openRequest = libraryOpenRequest,
+                listeningStats = listeningStats,
                 tracks = library,
                 currentTrack = currentTrack,
                 isPlaying = playback.playing,

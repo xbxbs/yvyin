@@ -1,5 +1,6 @@
 package com.example.xuebimc
 
+import android.content.Intent
 import android.icu.text.AlphabeticIndex
 import android.icu.text.Transliterator
 import android.os.Build
@@ -95,6 +96,7 @@ import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalAccessibilityManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
@@ -168,6 +170,7 @@ internal fun LibrarySurface(
     tracks: List<Track>,
     currentTrack: Track?,
     isPlaying: Boolean,
+    listeningStats: ListeningStatsSnapshot,
     loading: Boolean,
     hasPermission: Boolean,
     error: String?,
@@ -198,8 +201,16 @@ internal fun LibrarySurface(
     onScrollDirection: (Boolean) -> Unit = {},
     openRequest: LibraryOpenRequest? = null,
 ) {
+    val context = LocalContext.current
     var query by rememberSaveable { mutableStateOf("") }
-    var sort by rememberSaveable { mutableStateOf(LibrarySort.Title) }
+    val libraryPreferences = remember(context) {
+        context.getSharedPreferences("library_preferences", android.content.Context.MODE_PRIVATE)
+    }
+    var sort by rememberSaveable {
+        mutableStateOf(LibrarySort.entries.firstOrNull {
+            it.name == libraryPreferences.getString("library_sort", LibrarySort.Title.name)
+        } ?: LibrarySort.Title)
+    }
     var browseKind by rememberSaveable { mutableStateOf<LibraryBrowseKind?>(null) }
     var groupKey by rememberSaveable { mutableStateOf<String?>(null) }
     var handledOpenRequestId by rememberSaveable { mutableStateOf<Long?>(null) }
@@ -285,6 +296,15 @@ internal fun LibrarySurface(
         dismissKeyboard()
         menuTrack = track
         menuOpen = true
+    }
+    fun lyricoIntent(track: Track): Intent? {
+        if (track.isOnline) return null
+        val intent = Intent(Intent.ACTION_EDIT, track.uri).apply {
+            setPackage("com.lonx.lyrico")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            clipData = android.content.ClipData.newRawUri(track.title, track.uri)
+        }
+        return intent.takeIf { it.resolveActivity(context.packageManager) != null }
     }
     fun showFeedback(message: String) { feedback = ++feedbackRevision to message }
     fun selectFromList(track: Track, queue: List<Track>) {
@@ -446,6 +466,11 @@ internal fun LibrarySurface(
                         }
                         LibraryRecentShelf(recent, currentKey, isPlaying, animatePlayback && visible,
                             onSelect = { selectFromList(it, recent) }, onMore = ::openTrackMenu)
+                    }
+                }
+                if (!showSongsOnly && browseKind == null && searchTerm.isEmpty()) {
+                    item(key = "library:stats", contentType = "stats") {
+                        LibraryStatsSection(listeningStats, tracks)
                     }
                 }
                 if (!hasPermission && browseKind == null) {
@@ -628,6 +653,7 @@ internal fun LibrarySurface(
                         Box(Modifier.semantics { selected = sort == option }) {
                             SheetActionRow(option.label, selected = sort == option) {
                                 sort = option
+                                libraryPreferences.edit().putString("library_sort", option.name).apply()
                                 menuOpen = false
                                 scope.launch { listState.scrollToItem(0) }
                             }
@@ -663,6 +689,14 @@ internal fun LibrarySurface(
                         menuOpen = false
                         onAddToPlaylist(listOf(selectedTrack))
                     }
+                    lyricoIntent(selectedTrack)?.let { editIntent ->
+                        SheetActionDivider()
+                        SheetActionRow("编辑元数据", PlayerIconType.Info) {
+                            runCatching { context.startActivity(editIntent) }
+                                .onFailure { showFeedback("无法打开 Lyrico") }
+                            menuOpen = false
+                        }
+                    }
                 }
                 Spacer(Modifier.height(8.dp))
                 SheetActionGroup {
@@ -676,6 +710,38 @@ internal fun LibrarySurface(
                 SheetActionGroup { SheetActionRow("关闭") { menuOpen = false } }
             }
         }
+    }
+}
+
+@Composable
+private fun LibraryStatsSection(stats: ListeningStatsSnapshot, tracks: List<Track>) {
+    val titles = tracks.associateBy { it.stableKey }
+    val today = stats.secondsByDay[java.time.LocalDate.now().toEpochDay()] ?: 0L
+    Column(Modifier.fillMaxWidth().padding(top = 24.dp, bottom = 20.dp)) {
+        LibraryText("听歌统计", size = 20.sp, semibold = true)
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            LibraryStat("今天", "${today / 60} 分钟", Modifier.weight(1f))
+            LibraryStat("播放", "${stats.playsByTrack.values.sum()} 首", Modifier.weight(1f))
+        }
+        val top = stats.playsByTrack.entries.sortedByDescending { it.value }.take(3)
+        if (top.isNotEmpty()) {
+            LibraryText("常听歌曲", Modifier.padding(top = 16.dp), size = 13.sp, color = LibrarySecondary)
+            top.forEachIndexed { index, entry ->
+                Row(Modifier.fillMaxWidth().padding(top = 9.dp), verticalAlignment = Alignment.CenterVertically) {
+                    LibraryText("${index + 1}", Modifier.width(24.dp), size = 14.sp, color = LibraryTertiary)
+                    LibraryText(titles[entry.key]?.let(::libraryTitle) ?: "已移除歌曲", Modifier.weight(1f), size = 14.sp, maxLines = 1)
+                    LibraryText("${entry.value} 次", size = 13.sp, color = LibrarySecondary)
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryStat(label: String, value: String, modifier: Modifier) {
+    Column(modifier.clip(RoundedCornerShape(12.dp)).background(Color.White.copy(alpha = .055f)).padding(12.dp)) {
+        LibraryText(label, size = 12.sp, color = LibrarySecondary)
+        LibraryText(value, Modifier.padding(top = 5.dp), size = 18.sp, semibold = true)
     }
 }
 

@@ -29,6 +29,7 @@ data class AppPreferenceValues(
     val downloadTreeUri: String? = null,
     val downloadFolderName: String = "音乐/余音",
     val autoOpenPlayer: Boolean = true,
+    val liquidGlass: Boolean = false,
 )
 
 /** SharedPreferences is shared across instances; use that same monitor for each read/modify/publish. */
@@ -62,6 +63,8 @@ class AppPreferences(context: Context) {
     fun setAutoOpenPlayer(value: Boolean) = update {
         putBoolean(KEY_AUTO_OPEN_PLAYER, value)
     }
+
+    fun setLiquidGlass(value: Boolean) = update { putBoolean(KEY_LIQUID_GLASS, value) }
 
     /** The source's published levels must also be checked by the UI and resolver. */
     fun setOnlineQuality(value: String) {
@@ -104,6 +107,7 @@ class AppPreferences(context: Context) {
         downloadFolderName = preferences.getString(KEY_DOWNLOAD_FOLDER_NAME, DEFAULT_DOWNLOAD_FOLDER)
             ?.takeIf { it.isNotBlank() } ?: DEFAULT_DOWNLOAD_FOLDER,
         autoOpenPlayer = preferences.getBoolean(KEY_AUTO_OPEN_PLAYER, true),
+        liquidGlass = preferences.getBoolean(KEY_LIQUID_GLASS, false),
     )
 
     companion object {
@@ -115,10 +119,11 @@ class AppPreferences(context: Context) {
         const val KEY_DOWNLOAD_TREE_URI = "download_tree_uri"
         const val KEY_DOWNLOAD_FOLDER_NAME = "download_folder_name"
         const val KEY_AUTO_OPEN_PLAYER = "auto_open_player"
+        const val KEY_LIQUID_GLASS = "liquid_glass"
         const val DEFAULT_DOWNLOAD_FOLDER = "音乐/余音"
         val KEYS: Set<String> = setOf(
             KEY_ANIMATED_BACKGROUND, KEY_PREFER_HIGH_REFRESH, KEY_DEFAULT_ONLINE_SOURCE,
-            KEY_ONLINE_QUALITY, KEY_DOWNLOAD_TREE_URI, KEY_DOWNLOAD_FOLDER_NAME, KEY_AUTO_OPEN_PLAYER,
+            KEY_ONLINE_QUALITY, KEY_DOWNLOAD_TREE_URI, KEY_DOWNLOAD_FOLDER_NAME, KEY_AUTO_OPEN_PLAYER, KEY_LIQUID_GLASS,
         )
     }
 }

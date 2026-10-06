@@ -22,6 +22,7 @@ public data class LibraryOpenRequest(val id: Long, val track: Track, val artist:
 @Composable
 fun LibraryScreen(
     tracks: List<Track>, currentTrack: Track?, isPlaying: Boolean, loading: Boolean,
+    listeningStats: ListeningStatsSnapshot = ListeningStatsSnapshot(),
     hasPermission: Boolean, error: String?, onRequestPermission: () -> Unit,
     onRefresh: () -> Unit, onSelect: (Track) -> Unit, onOpenPlayer: () -> Unit,
     onTogglePlayback: () -> Unit, onImport: () -> Unit, onOnline: () -> Unit = {},
@@ -56,7 +57,7 @@ fun LibraryScreen(
     BackHandler(isActive && songsVisible) { songsVisible = false }
     @Composable fun Page(songs: Boolean) {
         LibrarySurface(
-            tracks, currentTrack, isPlaying, loading, hasPermission, error,
+            tracks, currentTrack, isPlaying, listeningStats, loading, hasPermission, error,
             onRequestPermission, onRefresh, onSelect, onOpenPlayer, onTogglePlayback, onImport,
             onOnline, onPlayList, onNext, onPlayNext, onAddToQueue, bottomInset,
             isActive = isActive && if (songs) songsVisible else !songsPresent,

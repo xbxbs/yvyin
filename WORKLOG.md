@@ -6,6 +6,8 @@
 
 ## 最新交付：短导航、Cupertino、真实设置与慢歌词上浮
 
+后续补充：听歌统计、排序持久化、Lyrico 元数据入口和液态玻璃开关已接入；统计按真实播放进度累计，排序写入本地偏好。液态玻璃采用当前 Compose/Haze 兼容的动态高光近似，没有强行加入要求更高 Compose 版本的外部 Backdrop 依赖。最终构建另行记录。
+
 后续修正版：搜索框已从列表外的悬浮定位层移回 `LazyColumn` 真实条目；它与资料库标题、分类一起滚动，不再因 `beforeContentPadding` 和独立 offset 叠加而盖住艺人/歌曲行。`assembleRelease --offline` 已再次通过（1m30s）。
 
 版本仍为 1.6 / code7。`assembleRelease --offline` 最终通过（1m46s）；交付 `dist/余音-v1.6-Cupertino与歌词修正.apk` 及对应源码包。以下优先于历史勾选。

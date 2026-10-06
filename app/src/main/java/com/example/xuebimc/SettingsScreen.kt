@@ -98,6 +98,14 @@ fun SettingsScreen(
                             colors = CupertinoSwitchDefaults.colors(checkedTrackColor = LibraryAccent),
                             modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "点歌时打开播放页" })
                     }
+                    PreferenceDivider()
+                    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        PreferenceText("液态玻璃", Modifier.weight(1f))
+                        CupertinoSwitch(checked = values.liquidGlass, onCheckedChange = preferences::setLiquidGlass,
+                            colors = CupertinoSwitchDefaults.colors(checkedTrackColor = LibraryAccent),
+                            modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "液态玻璃" })
+                    }
                 }
             }
             folderError?.let { error -> item(key = "settings:error") {

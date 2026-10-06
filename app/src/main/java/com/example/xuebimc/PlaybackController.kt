@@ -43,6 +43,7 @@ class PlaybackController(context: Context) {
     var trackResolver: (suspend (Track) -> Track)? = null
     private val audioManager = this.context.getSystemService(Context.AUDIO_SERVICE) as AudioManager
     private val preferences = this.context.getSharedPreferences("player", Context.MODE_PRIVATE)
+    val listeningStats = ListeningStats(this.context)
     private val favorites = preferences.getStringSet("favorite_tracks", emptySet()).orEmpty().toMutableSet()
     private val timeline = PlaybackTimeline()
     private val frameClock = PlaybackFrameClock()
@@ -58,6 +59,7 @@ class PlaybackController(context: Context) {
     private var seekTarget = 0L
     private var queuedSeek: Long? = null
     private var lastSampleRealtime = 0L
+    private var lastStatsRealtime = 0L
     private var playWhenReady = false
     private var resumeAfterFocusGain = false
     private var focusHeld = false
@@ -231,6 +233,7 @@ class PlaybackController(context: Context) {
         manualQueue = scheduler.manual.map(::project)
         contextQueue = scheduler.context.map(::project)
         currentTrack = currentQueueEntry?.track
+        listeningStats.onTrackStarted(currentTrack)
         contextSourceName = scheduler.contextSourceName
         autoplayEnabled = scheduler.autoplayEnabled
         shuffled = scheduler.shuffled
@@ -484,6 +487,8 @@ class PlaybackController(context: Context) {
         playWhenReady = false
         resumeAfterFocusGain = false
         positionMs = durationMs
+        lastStatsRealtime = 0L
+        listeningStats.flush()
         timeline.reset(positionMs, SystemClock.elapsedRealtime())
         if (advance && serviceObserver != null) {
             if (scheduler.advance(PlaybackQueue.Advance.Complete) != null) {
@@ -567,6 +572,8 @@ class PlaybackController(context: Context) {
         }
         if (abandonFocus) abandonAudioFocus()
         timeline.reset(positionMs, SystemClock.elapsedRealtime())
+        lastStatsRealtime = 0L
+        listeningStats.flush()
         changed()
     }
 
@@ -645,6 +652,9 @@ class PlaybackController(context: Context) {
             // Keep a handoff guard for stalled/resumed windows. During normal foreground frames,
             // the service no longer publishes ahead and creates duplicate/uneven rendered steps.
             positionMs = maxOf(positionMs, timeline.positionAt(now)).coerceIn(0L, durationMs)
+            val previousStats = lastStatsRealtime
+            lastStatsRealtime = now
+            if (previousStats > 0L) listeningStats.recordProgress(currentTrack, now - previousStats, playing)
         } catch (failure: Exception) {
             failMedia("读取播放进度失败：${failure.localizedMessage ?: "未知错误"}")
         }

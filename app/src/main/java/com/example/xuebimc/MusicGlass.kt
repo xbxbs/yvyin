@@ -27,6 +27,7 @@ import dev.chrisbanes.haze.HazeTint
 import dev.chrisbanes.haze.hazeEffect
 
 internal val LocalAnimatedBackground = staticCompositionLocalOf { true }
+internal val LocalLiquidGlass = staticCompositionLocalOf { false }
 private val GlassPageBackground = Color.Black
 
 /** Same single-layer material as the user-provided ChatGlass sample. */
@@ -46,6 +47,7 @@ internal fun Modifier.musicGlassSurface(backdrop: HazeState, shape: Shape): Modi
     }
     val hairline = with(LocalDensity.current) { .5f.toDp() }
     return clip(shape).border(hairline, rim, shape).hazeEffect(backdrop, style)
+        .then(if (LocalLiquidGlass.current) Modifier.liquidGlassSheen() else Modifier)
 }
 
 /** Blur radius fades toward the body; a separate opaque scrim protects header text. */
