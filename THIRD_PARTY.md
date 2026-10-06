@@ -23,6 +23,8 @@
 
 ## 独立资源
 
+- OkHttp 4.12.0 与 Okio 3.9.0：Square, Inc. 及项目贡献者，Apache-2.0；用于隔离全局 Cookie 的封面下载，不传递播放凭据。上游分别为 https://github.com/square/okhttp 和 https://github.com/square/okio，许可见 `app/src/main/assets/licenses/network-Apache-2.0.txt`。
+
 - Inter 与 Noto Sans SC 字体：SIL Open Font License 1.1。完整文本在 `app/src/main/assets/licenses/`。
 - 用户此前提供的《如诗一般的形容妳》音频、歌词和封面已移出 APK 资源，保留在工程 `dist/legacy-demo-backup/` 中。权利归各自权利人，程序许可证不授予这些媒体资源的再分发权。
 - 本地扫描读取用户授权的 MediaStore / 文档 URI；在线元信息与媒体权限归相应提供方。第三方 APK 只用于协议分析，不将其 DEX、Hermes 字节码、品牌素材或私密凭据打入本应用。

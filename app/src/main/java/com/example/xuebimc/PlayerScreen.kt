@@ -50,6 +50,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.TransformOrigin
@@ -185,6 +186,10 @@ fun PlayerScreen(
     val controlsPresent by remember { derivedStateOf { controls.value > .05f } }
     val controlsMounted by remember { derivedStateOf { controls.value > .001f } }
     val favoritePresent by remember { derivedStateOf { transition.value.x < .05f } }
+    // Share only the full cover. Never lift the compact lyric header or an invisible queue cover.
+    val fullCoverAtRest by remember {
+        derivedStateOf { transition.value.x <= .001f && transition.value.y <= .001f }
+    }
     val controlsEnabled = showControls && controlsPresent
     val seekGestureGuard = remember { PlayerSeekGestureGuard() }
     val seekGesture = PlayerSeekGesture(
@@ -196,7 +201,7 @@ fun PlayerScreen(
     )
     val marqueeEnabled = (rememberCoroutineScope().coroutineContext[MotionDurationScale]?.scaleFactor ?: 1f) > 0f
     BoxWithConstraints(
-        Modifier.fillMaxSize().background(Color(0xFF241F2C))
+        Modifier.fillMaxSize().sharedArtworkPlayerViewport().background(Color(0xFF241F2C))
             .pointerInput(showLyrics, seekGestureGuard) {
                 awaitPointerEventScope {
                     while (true) {
@@ -255,7 +260,16 @@ fun PlayerScreen(
                 val compactRadius = designSize(7f)
                 shape = RoundedCornerShape((9.dp + (compactRadius - 9.dp) * progress) / coverScale)
                 clip = true
-            }.then(if (queueVisible) Modifier.clearAndSetSemantics { } else Modifier),
+            }.sharedPlayerArtwork(
+                track = track,
+                fullBounds = with(density) {
+                    Rect(
+                        Offset(((pageWidth - fullCoverSize) / 2f).toPx(), (pageHeight * .138f).toPx()),
+                        Size(fullCoverSize.toPx(), fullCoverSize.toPx()),
+                    )
+                },
+                enabled = !detailVisible && fullCoverAtRest,
+            ).then(if (queueVisible) Modifier.clearAndSetSemantics { } else Modifier),
             requestSize = 512,
         )
         val titleWidth = pageWidth * .655f

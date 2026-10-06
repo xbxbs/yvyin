@@ -1,8 +1,10 @@
 package com.example.xuebimc
 
 import androidx.compose.foundation.Canvas
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -18,18 +20,22 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.asPaddingValues
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.remember
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
@@ -37,8 +43,8 @@ import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
-import androidx.compose.ui.layout.onSizeChanged
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
@@ -56,14 +62,20 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
+import kotlin.math.PI
+import kotlin.math.cos
+import kotlin.math.sin
+import kotlin.math.roundToInt
 
-private val GlassSecondary = Color.White.copy(alpha = .72f)
-private val GlassInactive = Color.White.copy(alpha = .80f)
-private val GlassSelected = Color(0xFFFFD0D8)
-private val MiniPlayerRadius = 28.dp
+private val GlassSecondary = Color(0xFFEBEBF5).copy(alpha = .6f)
+private val GlassInactive = Color(0xFFEBEBF5).copy(alpha = .6f)
+private val GlassSelected = Color(0xFFFA2D48)
+private val MiniPlayerRadius = 20.dp
 private val MiniPlayerInset = 8.dp
-private val TabBarRadius = 32.dp
-private val TabBarInset = 5.dp
+private val TabBarRadius = 29.dp
+private val TabBarInset = 4.dp
+
+enum class MusicTab { Library, Online, Settings }
 
 /**
  * Floating bottom chrome (iOS 26 style): a mini-player capsule above a tab capsule, both hovering
@@ -74,38 +86,89 @@ fun GlassTabBar(
     backdrop: HazeState,
     track: Track?,
     isPlaying: Boolean,
-    onlineSelected: Boolean,
-    onSelectLibrary: () -> Unit,
-    onSelectOnline: () -> Unit,
+    selectedTab: MusicTab,
+    onSelectTab: (MusicTab) -> Unit,
     onOpenPlayer: () -> Unit,
     onTogglePlayback: () -> Unit,
     onNext: () -> Unit,
     onHeightChange: (Dp) -> Unit,
     modifier: Modifier = Modifier,
+    compact: Boolean = false,
+    onExpand: () -> Unit = {},
 ) {
-    val density = LocalDensity.current
+    val navigationBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
+    // Reserve the expanded inset even while compact: changing list padding would reverse its
+    // scroll direction and cause a collapse/expand feedback loop near the final songs.
+    val reservedInset = (if (track == null) 58.dp else 122.dp) + navigationBottom + 24.dp
+    SideEffect { onHeightChange(reservedInset) }
+    val collapse = animateFloatAsState(if (compact && track != null) 1f else 0f,
+        spring(dampingRatio = .85f, stiffness = 380f), label = "bottomChromeCollapse")
+    @Composable fun Tabs(modifier: Modifier = Modifier) {
+        Row(
+            modifier.fillMaxWidth().height(58.dp)
+                .glassCapsule(backdrop, RoundedCornerShape(TabBarRadius)).padding(TabBarInset),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            GlassTab("资料库", GlassTabIcon.Library, selected = selectedTab == MusicTab.Library,
+                onClick = { onSelectTab(MusicTab.Library) }, modifier = Modifier.weight(1f))
+            GlassTab("在线", GlassTabIcon.Online, selected = selectedTab == MusicTab.Online,
+                onClick = { onSelectTab(MusicTab.Online) }, modifier = Modifier.weight(1f))
+            GlassTab("设置", GlassTabIcon.Settings, selected = selectedTab == MusicTab.Settings,
+                onClick = { onSelectTab(MusicTab.Settings) }, modifier = Modifier.weight(1f))
+        }
+    }
     Column(
         modifier
             .widthIn(max = 520.dp)
             .fillMaxWidth()
-            .onSizeChanged { onHeightChange(with(density) { it.height.toDp() } + 12.dp) }
             .navigationBarsPadding()
             .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
-        verticalArrangement = Arrangement.spacedBy(10.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp),
     ) {
-        if (track != null) {
-            Box(Modifier.fillMaxWidth().glassCapsule(backdrop, RoundedCornerShape(MiniPlayerRadius))) {
-                GlassMiniPlayer(track, isPlaying, onOpenPlayer, onTogglePlayback, onNext)
+        if (track == null) Tabs() else {
+            Layout(
+                modifier = Modifier.fillMaxWidth().clipToBounds(),
+                content = {
+                    Box(Modifier.glassCapsule(backdrop, RoundedCornerShape(MiniPlayerRadius))) {
+                        // The same mini-player stays composed throughout the morph.
+                        GlassMiniPlayer(track, isPlaying, onOpenPlayer, onTogglePlayback, onNext)
+                    }
+                    Tabs(if (compact) Modifier.clearAndSetSemantics {} else Modifier)
+                    Box(
+                        Modifier.musicGlassSurface(backdrop, CircleShape)
+                            .clickable(enabled = compact, role = Role.Button, onClick = onExpand)
+                            .then(if (compact) Modifier.semantics { contentDescription = "展开底部导航" }
+                                else Modifier.clearAndSetSemantics {}),
+                        contentAlignment = Alignment.Center,
+                    ) {
+                        GlassIcon(when (selectedTab) {
+                            MusicTab.Library -> GlassTabIcon.Library
+                            MusicTab.Online -> GlassTabIcon.Online
+                            MusicTab.Settings -> GlassTabIcon.Settings
+                        }, Modifier.size(22.dp), GlassSelected)
+                    }
+                },
+            ) { measurables, constraints ->
+                val p = collapse.value.coerceIn(0f, 1f)
+                val width = constraints.maxWidth
+                val miniHeight = 56.dp.roundToPx()
+                val tabsHeight = 58.dp.roundToPx()
+                val gap = 8.dp.roundToPx()
+                val circleWidth = 56.dp.roundToPx()
+                val miniWidth = (width - ((circleWidth + gap) * p).roundToInt()).coerceAtLeast(1)
+                val mini = measurables[0].measure(Constraints.fixed(miniWidth, miniHeight))
+                val tabs = measurables[1].measure(Constraints.fixed(width, tabsHeight))
+                val circle = measurables[2].measure(Constraints.fixed(circleWidth, miniHeight))
+                layout(width, miniHeight + ((tabsHeight + gap) * (1f - p)).roundToInt()) {
+                    mini.placeRelative(0, 0)
+                    tabs.placeRelativeWithLayer(0, miniHeight + gap) { alpha = 1f - p }
+                    circle.placeRelativeWithLayer(width - circleWidth, 0) {
+                        alpha = p
+                        scaleX = .85f + .15f * p
+                        scaleY = scaleX
+                    }
+                }
             }
-        }
-        Row(
-            Modifier.fillMaxWidth().height(64.dp)
-                .glassCapsule(backdrop, RoundedCornerShape(TabBarRadius))
-                .padding(TabBarInset),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            GlassTab("资料库", GlassTabIcon.Library, selected = !onlineSelected, onClick = onSelectLibrary, modifier = Modifier.weight(1f))
-            GlassTab("在线", GlassTabIcon.Online, selected = onlineSelected, onClick = onSelectOnline, modifier = Modifier.weight(1f))
         }
     }
 }
@@ -139,7 +202,8 @@ private fun GlassMiniPlayer(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             TrackArtwork(
-                track, Modifier.size(40.dp).clip(RoundedCornerShape(MiniPlayerRadius - MiniPlayerInset)).clearAndSetSemantics {},
+                track, Modifier.size(40.dp).sharedMiniArtwork(track, MiniPlayerRadius - MiniPlayerInset)
+                    .clip(RoundedCornerShape(MiniPlayerRadius - MiniPlayerInset)).clearAndSetSemantics {},
                 requestSize = 144,
             )
             Spacer(Modifier.width(10.dp))
@@ -159,17 +223,26 @@ private fun GlassMiniPlayer(
 
 @Composable
 private fun GlassTab(label: String, icon: GlassTabIcon, selected: Boolean, onClick: () -> Unit, modifier: Modifier) {
-    val color = if (selected) GlassSelected else GlassInactive
-    Column(
-        modifier.fillMaxHeight().clip(RoundedCornerShape(TabBarRadius - TabBarInset))
-            .background(if (selected) Color.White.copy(alpha = .06f) else Color.Transparent)
+    val color by animateColorAsState(if (selected) GlassSelected else GlassInactive,
+        spring(dampingRatio = .85f, stiffness = 500f), label = "tabInk")
+    val fill by animateColorAsState(if (selected) Color.White.copy(alpha = .065f) else Color.Transparent,
+        spring(dampingRatio = .85f, stiffness = 500f), label = "tabFill")
+    // The tap target fills its lane; only a small visual capsule sits behind the icon and label.
+    Box(
+        modifier.fillMaxHeight().clip(RoundedCornerShape(23.dp))
             .clickable(role = Role.Tab, onClick = onClick)
             .semantics { this.selected = selected },
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
+        contentAlignment = Alignment.Center,
     ) {
-        GlassIcon(icon, Modifier.size(22.dp), color)
-        GlassText(label, Modifier.padding(top = 2.dp), size = 11.sp, color = color, family = PlayerTypography.medium, align = TextAlign.Center)
+        Column(
+            Modifier.width(68.dp).height(46.dp).clip(RoundedCornerShape(23.dp)).background(fill),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.Center,
+        ) {
+            GlassIcon(icon, Modifier.size(20.dp), color)
+            GlassText(label, Modifier.padding(top = 2.dp), size = 10.sp, color = color,
+                family = PlayerTypography.medium, align = TextAlign.Center)
+        }
     }
 }
 
@@ -201,7 +274,7 @@ private fun GlassText(
     )
 }
 
-private enum class GlassTabIcon { Library, Online, Play, Pause, Next }
+private enum class GlassTabIcon { Library, Online, Settings, Play, Pause, Next }
 
 @Composable
 private fun GlassIcon(icon: GlassTabIcon, modifier: Modifier, color: Color) {
@@ -213,6 +286,19 @@ private fun GlassIcon(icon: GlassTabIcon, modifier: Modifier, color: Color) {
         }) {
             val stroke = Stroke(1.7f, cap = StrokeCap.Round, join = StrokeJoin.Round)
             when (icon) {
+                GlassTabIcon.Settings -> {
+                    val gear = Path()
+                    repeat(48) { step ->
+                        val angle = -PI / 2 + step * PI / 24
+                        val radius = if (step % 6 in 1..3) 9f else 7.3f
+                        val x = 12f + cos(angle).toFloat() * radius
+                        val y = 12f + sin(angle).toFloat() * radius
+                        if (step == 0) gear.moveTo(x, y) else gear.lineTo(x, y)
+                    }
+                    gear.close()
+                    drawPath(gear, color, style = stroke)
+                    drawCircle(color, 2.8f, Offset(12f, 12f), style = stroke)
+                }
                 GlassTabIcon.Library -> {
                     // Stacked albums: a back sleeve and a front square holding a note.
                     drawLine(color, Offset(6f, 3.5f), Offset(18f, 3.5f), 1.7f, StrokeCap.Round)

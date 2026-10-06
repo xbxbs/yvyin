@@ -1,10 +1,15 @@
 package com.example.xuebimc
 
+import android.icu.text.AlphabeticIndex
+import android.icu.text.Transliterator
+import android.os.Build
+import android.view.HapticFeedbackConstants
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.LinearEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.spring
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.ExperimentalFoundationApi
@@ -12,10 +17,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.Orientation
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.gestures.scrollable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
@@ -24,6 +34,7 @@ import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.WindowInsetsSides
 import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
@@ -60,17 +71,24 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.produceState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.focus.onFocusChanged
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
 import androidx.compose.ui.layout.layout
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.compositeOver
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
@@ -81,6 +99,9 @@ import androidx.compose.ui.platform.LocalAccessibilityManager
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.semantics.CustomAccessibilityAction
+import androidx.compose.ui.semantics.customActions
 import androidx.compose.ui.semantics.LiveRegionMode
 import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
@@ -106,8 +127,12 @@ import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import androidx.lifecycle.Lifecycle
@@ -115,14 +140,17 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.sin
+import java.util.Locale
 
-private val LibrarySecondary = Color.White.copy(alpha = .68f)
+private val LibrarySecondary = Color(0xFFEBEBF5).copy(alpha = .6f)
+private val LibraryTertiary = Color(0xFFEBEBF5).copy(alpha = .3f)
 private val LibraryHairline = Color.White.copy(alpha = .10f)
 private val LibraryGround = Color.Black
-private val LibraryRaised = Color(0xFF1C1B20)
-/** Same single accent as the player and shared action sheets. */
-internal val LibraryAccent = Color(0xFFF2506B)
+private val LibraryRaised = Color(0xFF1C1C1E)
+/** Page accent; playback surfaces keep their own palette. */
+internal val LibraryAccent = Color(0xFFFA2D48)
 
 private data class LibrarySearchResult(
     val index: LibraryIndex? = null,
@@ -131,6 +159,7 @@ private data class LibrarySearchResult(
     val matches: List<Track> = emptyList(),
     val groups: List<LibraryBrowseGroup> = emptyList(),
     val durationMs: Long = 0L,
+    val alphabet: Map<Char, Int> = emptyMap(),
 )
 
 @OptIn(ExperimentalFoundationApi::class)
@@ -164,7 +193,9 @@ internal fun LibrarySurface(
     onPlaylists: () -> Unit = {},
     playlistCount: Int = 0,
     onAddToPlaylist: (List<Track>) -> Unit = {},
-    onOpenSettings: () -> Unit = {},
+    backdropVisible: Boolean = true,
+    backdrop: HazeState? = null,
+    onScrollDirection: (Boolean) -> Unit = {},
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var sort by rememberSaveable { mutableStateOf(LibrarySort.Title) }
@@ -197,6 +228,34 @@ internal fun LibrarySurface(
     val animatePlayback = isActive && isPlaying && motionAllowed && !sheetShowing &&
         lifecycleState.isAtLeast(Lifecycle.State.RESUMED)
     val reportSheetVisibility by rememberUpdatedState(onOverlayVisibilityChange)
+    val reportScrollDirection by rememberUpdatedState(onScrollDirection)
+    val acceptUserScroll by rememberUpdatedState(isActive && !sheetShowing)
+    // Written only by consumed user drags, never by jump-to-letter, restore or sorting.
+    // The flow observes this state; composition never observes individual scroll offsets.
+    val userScrollDirection = remember { mutableStateOf<Boolean?>(null) }
+    val directionSlopPx = with(LocalDensity.current) { 8.dp.toPx() }
+    val userScrollConnection = remember(listState, directionSlopPx) {
+        object : NestedScrollConnection {
+            private var travel = 0f
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset {
+                if (!acceptUserScroll || source != NestedScrollSource.UserInput || consumed.y == 0f) return Offset.Zero
+                if (travel * consumed.y < 0f) travel = 0f
+                travel += consumed.y
+                if (abs(travel) >= directionSlopPx) {
+                    userScrollDirection.value = travel < 0f
+                    travel = 0f
+                }
+                return Offset.Zero
+            }
+        }
+    }
+    LaunchedEffect(listState) {
+        userScrollDirection.value = null
+        snapshotFlow { userScrollDirection.value }.distinctUntilChanged().collect { direction ->
+            if (direction != null && acceptUserScroll) reportScrollDirection(direction)
+        }
+    }
+    val indexJump = remember { arrayOfNulls<Job>(1) }
 
     fun dismissKeyboard() {
         keyboard?.hide()
@@ -237,6 +296,7 @@ internal fun LibrarySurface(
     LaunchedEffect(isActive) {
         if (!isActive) {
             menuOpen = false
+            userScrollDirection.value = null
             dismissKeyboard()
         }
     }
@@ -261,7 +321,7 @@ internal fun LibrarySurface(
     val pageTitle = if (groupKey != null) group?.title ?: "歌曲" else browseKind?.label ?: if (showSongsOnly) "歌曲" else "资料库"
     val browsingGroups = browseKind != null && groupKey == null
     val searchResult by produceState(
-        LibrarySearchResult(), readyIndex, route, searchTerm,
+        LibrarySearchResult(), readyIndex, route, searchTerm, showSongsOnly,
     ) {
         if (searchTerm.isNotEmpty()) delay(120)
         value = withContext(Dispatchers.Default) {
@@ -276,8 +336,11 @@ internal fun LibrarySurface(
                 terms.isEmpty() || terms.all { entry.title.contains(it, ignoreCase = true) } ||
                     entry.tracks.any { libraryMatches(it, terms) }
             }
-            LibrarySearchResult(readyIndex, route, searchTerm, matches, groups,
-                matches.sumOf { ensureActive(); it.durationMs.coerceAtLeast(0L) })
+            val (orderedMatches, alphabet) = if (showSongsOnly && !browsingGroups && sort != LibrarySort.Recent) {
+                libraryAlphabetIndex(matches, sort)
+            } else matches to emptyMap<Char, Int>()
+            LibrarySearchResult(readyIndex, route, searchTerm, orderedMatches, groups,
+                orderedMatches.sumOf { ensureActive(); it.durationMs.coerceAtLeast(0L) }, alphabet)
         }
     }
     val searching = readyIndex == null || searchResult.index !== readyIndex ||
@@ -289,9 +352,12 @@ internal fun LibrarySurface(
     val currentKey = currentTrack?.stableKey
     val density = LocalDensity.current
     var topBarHeight by remember { mutableStateOf(56.dp) }
-    var searchHeight by remember { mutableStateOf(60.dp) }
+    var searchHeight by remember { mutableStateOf(48.dp) }
     val headerFeatherHeight = 24.dp
-    val headerBackdrop = remember { HazeState() }
+    val ownBackdrop = remember { HazeState() }
+    // An external state lets the header and bottom bar sample this body once, without
+    // an ancestor source recording the header's own blur/scrim into another source.
+    val headerBackdrop = backdrop ?: ownBackdrop
     val searchTopPx by remember(listState, density) {
         derivedStateOf {
             val info = listState.layoutInfo
@@ -299,7 +365,9 @@ internal fun LibrarySurface(
             val heading = info.visibleItemsInfo.firstOrNull { it.key == "library:heading" }
             val top = with(density) { topBarHeight.roundToPx() }
             val searchOffset = search?.offset ?: heading?.let { it.offset + it.size }
-            (searchOffset?.plus(info.beforeContentPadding) ?: top).coerceAtLeast(top)
+            val naturalTop = searchOffset?.plus(info.beforeContentPadding)
+                ?: (top - with(density) { searchHeight.roundToPx() })
+            if (searchFocused) naturalTop.coerceAtLeast(top) else naturalTop
         }
     }
     val collapsed by remember(listState, density) {
@@ -315,23 +383,27 @@ internal fun LibrarySurface(
     val barAlpha by animateFloatAsState(
         if (collapsed) 1f else 0f, tween(if (motionAllowed) 160 else 0), label = "library-bar",
     )
-    // A covered library draws normally without capturing another viewport for the player.
-    val sampleBackdrop = isActive && lifecycleState.isAtLeast(Lifecycle.State.STARTED)
+    // Input becomes inactive at transition START, not when this page is fully covered.
+    // Keep the source alive for both entry/exit animations; the owner reports visibility.
+    val sampleBackdrop = backdropVisible && lifecycleState.isAtLeast(Lifecycle.State.STARTED)
 
     Box(Modifier.fillMaxSize().background(LibraryGround)) {
         Box(
             Modifier.fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
-                .imePadding().then(if (sheetShowing) Modifier.clearAndSetSemantics {} else Modifier),
+                .imePadding().nestedScroll(userScrollConnection)
+                .then(if (sheetShowing) Modifier.clearAndSetSemantics {} else Modifier),
         ) {
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize().semantics { paneTitle = pageTitle }
                     // Foreground navigation and search never feed back into the source.
-                    .then(if (sampleBackdrop) Modifier.hazeSource(headerBackdrop) else Modifier),
+                    .then(if (sampleBackdrop) Modifier.hazeSource(headerBackdrop,
+                        zIndex = if (showSongsOnly) 1f else 0f) else Modifier),
                 // The parent already includes its floating bar + system navigation in bottomInset.
                 // Keep the initial heading below the feather; padding scrolls away, not the viewport.
-                contentPadding = PaddingValues(start = 18.dp, end = 18.dp,
+                contentPadding = PaddingValues(start = 18.dp,
+                    end = if (showSongsOnly && searchResult.alphabet.isNotEmpty() && !searching) 32.dp else 18.dp,
                     top = topBarHeight + headerFeatherHeight, bottom = bottomInset + 24.dp),
             ) {
                 item(key = "library:heading", contentType = "heading") {
@@ -376,10 +448,12 @@ internal fun LibrarySurface(
                 if (showSongsOnly || browseKind != null || searchTerm.isNotEmpty() || tracks.isEmpty()) {
                 item(key = "library:section", contentType = "section") {
                     Column(Modifier.fillMaxWidth().padding(top = 24.dp, bottom = 10.dp)) {
-                        LibraryText(
-                            if (searchTerm.isNotEmpty()) "搜索结果" else if (browsingGroups) browseKind!!.label else "歌曲",
-                            size = 20.sp, semibold = true,
-                        )
+                        if (searchTerm.isNotEmpty() || !showSongsOnly) {
+                            LibraryText(
+                                if (searchTerm.isNotEmpty()) "搜索结果" else if (browsingGroups) browseKind!!.label else "歌曲",
+                                size = 20.sp, semibold = true,
+                            )
+                        }
                         LibraryText(
                             when {
                                 searching -> if (searchTerm.isNotEmpty()) "正在搜索…" else "正在整理…"
@@ -460,26 +534,19 @@ internal fun LibrarySurface(
             }
             MusicHeaderGlass(
                 backdrop = headerBackdrop,
-                headerHeight = topBarHeight,
+                // One top-anchored material, never a second floating full-width scrim.
+                // The search surface is opaque on its own while travelling to the top.
+                headerHeight = topBarHeight + if (searchFocused && collapsed) searchHeight else 0.dp,
                 featherHeight = headerFeatherHeight,
                 enabled = sampleBackdrop,
             )
-            MusicHeaderGlass(
-                backdrop = headerBackdrop,
-                headerHeight = searchHeight,
-                featherHeight = headerFeatherHeight,
-                modifier = Modifier.offset { IntOffset(0, searchTopPx) }
-                    .graphicsLayer {
-                        // Fade in only as search approaches its pinned position, without recomposition.
-                        alpha = ((topBarHeight.toPx() + headerFeatherHeight.toPx() - searchTopPx) /
-                            headerFeatherHeight.toPx()).coerceIn(0f, 1f)
-                    },
-                enabled = sampleBackdrop,
-            )
+            // Search scrolls away with the large heading, clipped above the compact toolbar.
+            // Keeping field and clipping in one layer avoids reintroducing the detached black band.
+            Box(Modifier.fillMaxSize().padding(top = topBarHeight).clipToBounds()) {
             Box(
                 Modifier.fillMaxWidth()
                     // Placement and drawing, not composition, observe the per-frame search position.
-                    .offset { IntOffset(0, searchTopPx) }
+                    .offset { IntOffset(0, searchTopPx - with(density) { topBarHeight.roundToPx() }) }
                     .onSizeChanged { searchHeight = with(density) { it.height.toDp() } }
                     // Preserve dragging the old sticky search area to scroll the list.
                     .scrollable(listState, Orientation.Vertical, enabled = isActive, reverseDirection = true)
@@ -487,6 +554,7 @@ internal fun LibrarySurface(
             ) {
                 LibrarySearchField(query, searchFocused,
                     onQueryChange = { query = it }, onFocusChange = { searchFocused = it }, onCancel = ::cancelSearch)
+            }
             }
             Row(
                 Modifier.fillMaxWidth().heightIn(min = 56.dp)
@@ -509,7 +577,25 @@ internal fun LibrarySurface(
                     dismissKeyboard()
                     menuTrack = null
                     menuOpen = true
-                }, color = LibraryAccent)
+                }, color = LibrarySecondary)
+            }
+            if (showSongsOnly && !browsingGroups && !searching && !searchFocused &&
+                searchResult.alphabet.isNotEmpty() && isActive && !sheetShowing) {
+                LibraryAlphabetRail(
+                    targets = searchResult.alphabet,
+                    modifier = Modifier.align(Alignment.CenterEnd).fillMaxHeight().width(28.dp)
+                        .padding(top = topBarHeight + headerFeatherHeight, bottom = bottomInset + 12.dp),
+                    onSelect = { letter ->
+                        val trackIndex = searchResult.alphabet[letter]
+                        if (trackIndex != null) {
+                            // Heading, search spacer, summary; notices are optional preceding items.
+                            val firstTrack = 3 + (if (!hasPermission && browseKind == null) 1 else 0) +
+                                (if (!error.isNullOrBlank()) 1 else 0)
+                            indexJump[0]?.cancel()
+                            indexJump[0] = scope.launch { listState.scrollToItem(firstTrack + trackIndex) }
+                        }
+                    },
+                )
             }
         }
         if (feedback != null && isActive && !sheetShowing) {
@@ -528,8 +614,6 @@ internal fun LibrarySurface(
                 LibraryText("资料库", Modifier.padding(16.dp), size = 17.sp, semibold = true)
                 SheetActionDivider()
                 SheetActionGroup {
-                    SheetActionRow("设置", PlayerIconType.Settings) { menuOpen = false; onOpenSettings() }
-                    SheetActionDivider()
                     SheetActionRow("导入音乐") { menuOpen = false; onImport() }
                     SheetActionDivider()
                     if (loading) {
@@ -735,15 +819,17 @@ private fun LibrarySearchField(
     val focus = LocalFocusManager.current
     Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
       Row(
-        Modifier.weight(1f).heightIn(min = 48.dp).clip(RoundedCornerShape(12.dp))
-            .background(LibraryRaised.copy(alpha = .58f)).padding(start = 14.dp), verticalAlignment = Alignment.CenterVertically,
+        Modifier.weight(1f).heightIn(min = 36.dp).clip(RoundedCornerShape(10.dp))
+            // Same resting colour as before, but never composite sharp song text into the field.
+            .background(LibraryRaised.copy(alpha = .58f).compositeOver(LibraryGround))
+            .padding(start = 10.dp), verticalAlignment = Alignment.CenterVertically,
       ) {
-        LibraryGlyph(LibrarySymbol.Search, Modifier.size(20.dp), LibrarySecondary)
-        Spacer(Modifier.width(10.dp))
+        LibraryGlyph(LibrarySymbol.Search, Modifier.size(18.dp), LibrarySecondary)
+        Spacer(Modifier.width(8.dp))
         BasicTextField(
             value = query,
             onValueChange = onQueryChange,
-            modifier = Modifier.weight(1f).heightIn(min = 48.dp).onFocusChanged { onFocusChange(it.isFocused) }
+            modifier = Modifier.weight(1f).heightIn(min = 36.dp).onFocusChanged { onFocusChange(it.isFocused) }
                 .semantics { contentDescription = "搜索本地音乐" },
             textStyle = TextStyle(
                 color = Color.White, fontSize = 16.sp, fontFamily = PlayerTypography.familyFor(query),
@@ -757,7 +843,7 @@ private fun LibrarySearchField(
                 focus.clearFocus()
             }),
             decorationBox = { field ->
-                Box(Modifier.heightIn(min = 48.dp).padding(vertical = 12.dp), contentAlignment = Alignment.CenterStart) {
+                Box(Modifier.heightIn(min = 36.dp).padding(vertical = 6.dp), contentAlignment = Alignment.CenterStart) {
                     if (query.isEmpty()) {
                         LibraryText("搜索歌曲、艺人或专辑", size = 15.sp, color = LibrarySecondary)
                     }
@@ -766,15 +852,20 @@ private fun LibrarySearchField(
             },
         )
         if (query.isNotEmpty()) {
-            LibraryIconButton(LibrarySymbol.Clear, "清除搜索", { onQueryChange("") })
+            Box(Modifier.size(36.dp).clickable(role = Role.Button, onClickLabel = "清除搜索", onClick = { onQueryChange("") })
+                .semantics { contentDescription = "清除搜索" }, contentAlignment = Alignment.Center) {
+                Box(Modifier.size(18.dp).clip(CircleShape).background(LibrarySecondary), contentAlignment = Alignment.Center) {
+                    LibraryGlyph(LibrarySymbol.Clear, Modifier.size(14.dp), LibraryGround)
+                }
+            }
         } else {
             Spacer(Modifier.width(12.dp))
         }
       }
       if (focused || query.isNotEmpty()) {
           Spacer(Modifier.width(8.dp))
-          Box(Modifier.widthIn(min = 48.dp).heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onCancel)
-              .padding(horizontal = 8.dp, vertical = 12.dp), contentAlignment = Alignment.Center) {
+          Box(Modifier.widthIn(min = 48.dp).heightIn(min = 36.dp).clickable(role = Role.Button, onClick = onCancel)
+              .padding(horizontal = 8.dp, vertical = 6.dp), contentAlignment = Alignment.Center) {
               LibraryText("取消", size = 16.sp, color = LibraryAccent, medium = true)
           }
       }
@@ -800,30 +891,37 @@ private fun LibraryTrackRow(
                 .padding(vertical = 10.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Box {
+            Box(Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)).drawWithContent {
+                drawContent()
+                // Half a physical pixel, not half a dp; the outline never changes cover geometry.
+                drawRoundRect(Color.White.copy(alpha = .18f), topLeft = Offset(.25f, .25f),
+                    size = Size((size.width - .5f).coerceAtLeast(0f), (size.height - .5f).coerceAtLeast(0f)),
+                    cornerRadius = CornerRadius(6.dp.toPx()), style = Stroke(.5f))
+            }) {
                 TrackArtwork(
-                    track, Modifier.size(48.dp).clip(RoundedCornerShape(7.dp)).clearAndSetSemantics {},
+                    track, Modifier.fillMaxSize().clearAndSetSemantics {},
                     requestSize = 160,
                 )
                 if (isCurrent) {
                     Box(
-                        Modifier.matchParentSize().clip(RoundedCornerShape(7.dp)).background(Color.Black.copy(alpha = .45f)),
+                        Modifier.matchParentSize().background(Color.Black.copy(alpha = .45f)),
                         contentAlignment = Alignment.Center,
                     ) {
-                        if (isPlaying) LibraryEqualizer(animateBars, Modifier.size(18.dp))
-                        else LibraryGlyph(LibrarySymbol.Pause, Modifier.size(18.dp), LibraryAccent)
+                        LibraryEqualizer(animateBars && isPlaying, Modifier.size(18.dp))
                     }
                 }
             }
             Spacer(Modifier.width(12.dp))
             Column(Modifier.weight(1f)) {
-                LibraryText(libraryTitle(track), size = 16.sp, medium = true, color = if (isCurrent) LibraryAccent else Color.White)
+                LibraryText(libraryTitle(track), size = 17.sp)
                 LibraryText(
-                    librarySubtitle(track), size = 13.sp, color = LibrarySecondary,
-                    modifier = Modifier.padding(top = 5.dp),
+                    librarySubtitle(track), size = 15.sp, color = LibrarySecondary,
+                    modifier = Modifier.padding(top = 3.dp),
                 )
             }
             Spacer(Modifier.width(8.dp))
+            LibraryText(libraryTrackDuration(track.durationMs), Modifier.widthIn(min = 38.dp),
+                size = 13.sp, color = LibraryTertiary, align = TextAlign.End)
             LibraryIconButton(LibrarySymbol.More, "${libraryTitle(track)}的更多操作", onMore, color = LibrarySecondary)
         }
         Box(Modifier.padding(start = 60.dp).fillMaxWidth().height(.5.dp).background(LibraryHairline))
@@ -834,16 +932,16 @@ private fun LibraryTrackRow(
 private fun LibraryEqualizer(animate: Boolean, modifier: Modifier) {
     val phase = remember { Animatable(0f) }
     LaunchedEffect(animate) {
-        phase.snapTo(0f)
-        if (animate) phase.animateTo(1f, infiniteRepeatable(tween(1100, easing = LinearEasing)))
+        // Cancellation freezes the actual bar heights on pause; resume from that same phase.
+        if (animate) phase.animateTo(phase.value + 1f, infiniteRepeatable(tween(1100, easing = LinearEasing)))
     }
     Canvas(modifier.clearAndSetSemantics {}) {
         // Read only in draw, not composition. No loop is left running in a paused/hidden row.
         val time = phase.value * (2f * PI.toFloat())
         repeat(3) { bar ->
-            val wave = if (animate) (sin(time + bar * 2.1f) + 1f) * .5f else when (bar) { 0 -> .35f; 1 -> .9f; else -> .6f }
+            val wave = (sin(time + bar * 2.1f) + 1f) * .5f
             val x = size.width * (.2f + bar * .3f)
-            drawLine(LibraryAccent, Offset(x, size.height * .88f),
+            drawLine(Color.White, Offset(x, size.height * .88f),
                 Offset(x, size.height * (.66f - .52f * wave)), size.width * .14f, StrokeCap.Round)
         }
     }
@@ -914,10 +1012,21 @@ private fun LibraryAction(
     emphasized: Boolean = false,
 ) {
     val foreground = (if (emphasized) LibraryAccent else Color.White).copy(alpha = if (enabled) 1f else .42f)
+    val interaction = remember { MutableInteractionSource() }
+    val pressed by interaction.collectIsPressedAsState()
+    val scale by animateFloatAsState(if (pressed && enabled) .97f else 1f,
+        spring(dampingRatio = .85f, stiffness = 700f), label = "library-action-press")
+    val highlight by animateFloatAsState(if (pressed && enabled) .1f else 0f,
+        tween(90), label = "library-action-highlight")
+    val view = LocalView.current
     Row(
-        modifier.heightIn(min = 48.dp).clip(RoundedCornerShape(12.dp))
-            .background(Color.White.copy(alpha = if (emphasized) .09f else .06f))
-            .clickable(enabled = enabled, role = Role.Button, onClick = onClick)
+        modifier.heightIn(min = 50.dp).graphicsLayer { scaleX = scale; scaleY = scale }
+            .clip(RoundedCornerShape(12.dp)).background(LibraryRaised)
+            .drawWithContent { drawContent(); if (highlight > 0f) drawRect(Color.White.copy(alpha = highlight)) }
+            .clickable(interactionSource = interaction, indication = null, enabled = enabled, role = Role.Button, onClick = {
+                view.performHapticFeedback(HapticFeedbackConstants.CLOCK_TICK)
+                onClick()
+            })
             .padding(horizontal = 14.dp, vertical = 12.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.Center,
@@ -926,7 +1035,7 @@ private fun LibraryAction(
             LibraryGlyph(symbol, Modifier.size(18.dp), foreground)
             Spacer(Modifier.width(8.dp))
         }
-        LibraryText(label, Modifier.weight(1f, fill = false), size = 14.sp, color = foreground, medium = true)
+        LibraryText(label, Modifier.weight(1f, fill = false), size = 17.sp, color = foreground, medium = true)
     }
 }
 
@@ -1038,6 +1147,111 @@ private fun LibraryGlyph(symbol: LibrarySymbol, modifier: Modifier, color: Color
             }
         }
     }
+}
+
+/** Runs only in the search/index worker, never while composing or drawing a row. */
+private suspend fun libraryAlphabetIndex(
+    tracks: List<Track>, sort: LibrarySort,
+): Pair<List<Track>, Map<Char, Int>> {
+    if (tracks.isEmpty()) return tracks to emptyMap()
+    val active = currentCoroutineContext()
+    // Transliterator is public from API 29; older supported phones still get ICU pinyin buckets.
+    val latin = if (Build.VERSION.SDK_INT >= 29) Transliterator.getInstance("Any-Latin; Latin-ASCII") else null
+    val legacyAlphabet = if (latin == null) {
+        AlphabeticIndex<String>(Locale.CHINA).addLabels(Locale.ENGLISH).buildImmutableIndex()
+    } else null
+    val collator = java.text.Collator.getInstance(Locale.CHINA).apply { strength = java.text.Collator.PRIMARY }
+    val transliterations = HashMap<String, String>()
+    data class Entry(val track: Track, val key: String, val section: Char, val position: Int)
+    val entries = tracks.mapIndexed { position, track ->
+        active.ensureActive()
+        val text = if (sort == LibrarySort.Artist) libraryArtist(track) else libraryTitle(track)
+        val key = transliterations.getOrPut(text) { (latin?.transliterate(text.trim()) ?: text.trim()).uppercase(Locale.ROOT) }
+        val initial = key.firstOrNull()?.takeIf { it in 'A'..'Z' }
+            ?: legacyAlphabet?.let { it.getBucket(it.getBucketIndex(text))?.label?.singleOrNull()?.takeIf { label -> label in 'A'..'Z' } }
+            ?: '#'
+        Entry(track, key, initial, position)
+    }.sortedWith(Comparator { a, b ->
+        active.ensureActive()
+        val section = (if (a.section == '#') '[' else a.section).compareTo(if (b.section == '#') '[' else b.section)
+        section.takeIf { it != 0 } ?: collator.compare(a.key, b.key).takeIf { it != 0 } ?: a.position.compareTo(b.position)
+    })
+    val targets = LinkedHashMap<Char, Int>()
+    entries.forEachIndexed { index, entry ->
+        active.ensureActive()
+        if (entry.section !in targets) targets[entry.section] = index
+    }
+    return entries.map { it.track } to targets
+}
+
+private val LibraryAlphabet = ('A'..'Z').toList() + '#'
+
+@Composable
+private fun LibraryAlphabetRail(
+    targets: Map<Char, Int>, modifier: Modifier = Modifier, onSelect: (Char) -> Unit,
+) {
+    val selectLetter by rememberUpdatedState(onSelect)
+    var pressedLetter by remember { mutableStateOf<Char?>(null) }
+    BoxWithConstraints(modifier) {
+        Column(
+            Modifier.align(Alignment.Center).fillMaxWidth().height(maxHeight.coerceAtMost(432.dp))
+                .semantics {
+                    contentDescription = "歌曲快速索引"
+                    customActions = LibraryAlphabet.filter { it in targets }.map { letter ->
+                        CustomAccessibilityAction("跳至 $letter") { selectLetter(letter); true }
+                    }
+                }
+                .pointerInput(targets) {
+                    awaitEachGesture {
+                        val down = awaitFirstDown()
+                        down.consume()
+                        var last: Char? = null
+                        fun selectAt(y: Float) {
+                            val slot = (y / size.height.coerceAtLeast(1) * LibraryAlphabet.size).toInt()
+                                .coerceIn(LibraryAlphabet.indices)
+                            val letter = LibraryAlphabet[slot]
+                            if (letter in targets && letter != last) {
+                                last = letter
+                                pressedLetter = letter
+                                selectLetter(letter)
+                            }
+                        }
+                        try {
+                            selectAt(down.position.y)
+                            do {
+                                val event = awaitPointerEvent()
+                                val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                                if (!change.pressed) break
+                                change.consume()
+                                selectAt(change.position.y)
+                            } while (true)
+                        } finally {
+                            pressedLetter = null
+                        }
+                    }
+                },
+        ) {
+            LibraryAlphabet.forEach { letter ->
+                Box(Modifier.fillMaxWidth().weight(1f).clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
+                    LibraryText(letter.toString(), size = 11.sp, semibold = true,
+                        color = when {
+                            letter == pressedLetter -> Color.White
+                            letter in targets -> LibraryAccent
+                            else -> LibraryTertiary
+                        }, align = TextAlign.Center)
+                }
+            }
+        }
+    }
+}
+
+private fun libraryTrackDuration(durationMs: Long): String {
+    if (durationMs <= 0L) return "—"
+    val totalSeconds = durationMs / 1000
+    val seconds = (totalSeconds % 60).toString().padStart(2, '0')
+    val minutes = totalSeconds / 60
+    return if (minutes < 60) "$minutes:$seconds"
+    else "${minutes / 60}:${(minutes % 60).toString().padStart(2, '0')}:$seconds"
 }
 
 private fun libraryTotalDuration(durationMs: Long): String {

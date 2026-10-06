@@ -20,9 +20,8 @@ import java.io.File
 import java.io.FileNotFoundException
 import java.io.IOException
 import java.io.InputStream
-import java.net.CookieHandler
-import java.net.HttpURLConnection
 import java.net.URL
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -33,6 +32,13 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
+import okhttp3.Authenticator
+import okhttp3.Call
+import okhttp3.CookieJar
+import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
 
 /** Permissions and persistable SAF grants belong to the activity, never to this repository. */
 class LocalMusicRepository(context: Context) {
@@ -140,89 +146,7 @@ class LocalMusicRepository(context: Context) {
     }
 
     /** Only artwork bytes, in memory; no playback headers, cookies, disk cache or automatic redirects. */
-    private suspend fun downloadArtwork(uri: Uri): ByteArray? = withTimeoutOrNull(REMOTE_TOTAL_TIMEOUT_MS) {
-        suspendCancellableCoroutine<ByteArray> { continuation ->
-            val inFlight = AtomicReference<HttpURLConnection?>()
-            continuation.invokeOnCancellation { inFlight.getAndSet(null)?.disconnectQuietly() }
-            try {
-                var url = URL(uri.toString())
-                for (hop in 0..MAX_ARTWORK_REDIRECTS) {
-                    continuation.context.ensureActive()
-                    if (url.protocol != "https" && url.protocol != "http") throw IOException("不支持的封面协议")
-                    if (url.host.isBlank() || url.userInfo != null || url.toExternalForm().length > MAX_ARTWORK_URL_LENGTH) {
-                        throw IOException("无效的封面地址")
-                    }
-                    // HttpURLConnection can silently add ambient cookies. Fail closed instead of
-                    // replacing the process-wide handler and disrupting concurrent account requests.
-                    if (CookieHandler.getDefault() != null) throw IOException("封面请求不使用全局 Cookie")
-                    val connection = url.openConnection() as HttpURLConnection
-                    inFlight.set(connection)
-                    try {
-                        continuation.context.ensureActive()
-                        connection.requestMethod = "GET"
-                        connection.instanceFollowRedirects = false
-                        connection.useCaches = false
-                        connection.connectTimeout = REMOTE_CONNECT_TIMEOUT_MS
-                        connection.readTimeout = REMOTE_READ_TIMEOUT_MS
-                        connection.setRequestProperty("Accept", "image/*")
-                        connection.setRequestProperty("Accept-Encoding", "identity")
-                        connection.setRequestProperty("Connection", "close")
-                        // In particular, do not forward track.requestHeaders (Cookie/Authorization).
-                        if (CookieHandler.getDefault() != null) throw IOException("封面请求不使用全局 Cookie")
-                        val status = connection.responseCode
-                        continuation.context.ensureActive()
-                        if (status == 301 || status == 302 || status == 303 || status == 307 || status == 308) {
-                            if (hop >= MAX_ARTWORK_REDIRECTS) throw IOException("封面重定向过多")
-                            val location = connection.getHeaderField("Location")?.trim()
-                                ?.takeIf { it.isNotEmpty() && it.length <= MAX_ARTWORK_URL_LENGTH }
-                                ?: throw IOException("封面重定向缺少地址")
-                            val next = URL(url, location)
-                            if (url.protocol == "https" && next.protocol != "https") {
-                                throw IOException("封面不允许 HTTPS 降级")
-                            }
-                            url = next
-                            continue
-                        }
-                        if (status != HttpURLConnection.HTTP_OK) throw IOException("封面 HTTP $status")
-                        if (connection.contentLengthLong > MAX_REMOTE_ARTWORK_BYTES) throw IOException("封面超过 2 MiB")
-                        val encoding = connection.getHeaderField("Content-Encoding")
-                        if (!encoding.isNullOrBlank() && !encoding.trim().equals("identity", true)) {
-                            throw IOException("不支持的封面传输编码")
-                        }
-                        val type = connection.contentType?.substringBefore(';')?.trim()?.lowercase()
-                        if (!type.isNullOrBlank() && !type.startsWith("image/") && type != "application/octet-stream") {
-                            throw IOException("封面响应不是图片")
-                        }
-                        val output = ByteArrayOutputStream(8192)
-                        val buffer = ByteArray(8192)
-                        connection.inputStream.use { input ->
-                            while (true) {
-                                continuation.context.ensureActive()
-                                val count = input.read(buffer, 0, minOf(buffer.size, MAX_REMOTE_ARTWORK_BYTES - output.size() + 1))
-                                continuation.context.ensureActive()
-                                if (count < 0) break
-                                if (output.size() + count > MAX_REMOTE_ARTWORK_BYTES) throw IOException("封面超过 2 MiB")
-                                output.write(buffer, 0, count)
-                            }
-                        }
-                        continuation.context.ensureActive()
-                        continuation.resume(output.toByteArray())
-                        return@suspendCancellableCoroutine
-                    } finally {
-                        inFlight.compareAndSet(connection, null)
-                        connection.disconnectQuietly()
-                    }
-                }
-                throw IOException("封面重定向过多")
-            } catch (error: Exception) {
-                continuation.resumeWithException(error)
-            }
-        }
-    }
-
-    private fun HttpURLConnection.disconnectQuietly() {
-        try { disconnect() } catch (_: Exception) { /* Preserve cancellation / the original failure. */ }
-    }
+    private suspend fun downloadArtwork(uri: Uri): ByteArray? = RemoteArtworkHttp.download(uri.toString())
 
     suspend fun importAudio(uri: Uri): Track = withContext(Dispatchers.IO) {
         val info = optional {
@@ -594,11 +518,107 @@ class LocalMusicRepository(context: Context) {
         const val UNKNOWN = "未知"
         const val MAX_ARTWORK_EDGE = 2048
         const val MAX_ARTWORK_BYTES = 16 * 1024 * 1024
-        const val MAX_REMOTE_ARTWORK_BYTES = 2 * 1024 * 1024
-        const val MAX_ARTWORK_REDIRECTS = 3
-        const val MAX_ARTWORK_URL_LENGTH = 4096
-        const val REMOTE_CONNECT_TIMEOUT_MS = 5_000
-        const val REMOTE_READ_TIMEOUT_MS = 5_000
-        const val REMOTE_TOTAL_TIMEOUT_MS = 15_000L
+    }
+}
+
+/** Dedicated image transport: never reads, installs or changes the process CookieHandler. */
+internal object RemoteArtworkHttp {
+    private const val MAX_REMOTE_ARTWORK_BYTES = 2 * 1024 * 1024
+    private const val MAX_ARTWORK_REDIRECTS = 3
+    private const val MAX_ARTWORK_URL_LENGTH = 4096
+    private const val REMOTE_TOTAL_TIMEOUT_MS = 15_000L
+
+    private val client by lazy {
+        OkHttpClient.Builder()
+            .cookieJar(CookieJar.NO_COOKIES)
+            .authenticator(Authenticator.NONE)
+            .proxyAuthenticator(Authenticator.NONE)
+            .cache(null)
+            .followRedirects(false)
+            .followSslRedirects(false)
+            .retryOnConnectionFailure(false)
+            .connectTimeout(5_000, TimeUnit.MILLISECONDS)
+            .readTimeout(5_000, TimeUnit.MILLISECONDS)
+            .callTimeout(REMOTE_TOTAL_TIMEOUT_MS, TimeUnit.MILLISECONDS)
+            .build()
+    }
+
+    // Android-independent entry point lets a JVM fixture test this exact production HTTP path.
+    suspend fun download(value: String): ByteArray? = withContext(Dispatchers.IO) {
+        withTimeoutOrNull(REMOTE_TOTAL_TIMEOUT_MS) {
+            suspendCancellableCoroutine<ByteArray> { continuation ->
+                val inFlight = AtomicReference<Call?>()
+                continuation.invokeOnCancellation { inFlight.getAndSet(null)?.cancel() }
+                try {
+                    var url = checkedUrl(value)
+                    for (hop in 0..MAX_ARTWORK_REDIRECTS) {
+                        continuation.context.ensureActive()
+                        // Each hop is fresh. Playback headers and authentication are never copied.
+                        val call = client.newCall(Request.Builder().url(url)
+                            .header("Accept", "image/*")
+                            .header("Accept-Encoding", "identity")
+                            .get().build())
+                        inFlight.set(call)
+                        try {
+                            continuation.context.ensureActive()
+                            call.execute().use { response ->
+                                continuation.context.ensureActive()
+                                val status = response.code
+                                if (status in listOf(301, 302, 303, 307, 308)) {
+                                    if (hop >= MAX_ARTWORK_REDIRECTS) throw IOException("封面重定向过多")
+                                    val location = response.header("Location")?.trim()
+                                        ?.takeIf { it.isNotEmpty() && it.length <= MAX_ARTWORK_URL_LENGTH }
+                                        ?: throw IOException("封面重定向缺少地址")
+                                    val next = checkedUrl(URL(url.toUrl(), location).toString())
+                                    if (url.isHttps && !next.isHttps) throw IOException("封面不允许 HTTPS 降级")
+                                    url = next
+                                } else {
+                                    if (status != 200) throw IOException("封面 HTTP $status")
+                                    val body = response.body ?: throw IOException("封面响应为空")
+                                    if (body.contentLength() > MAX_REMOTE_ARTWORK_BYTES) throw IOException("封面超过 2 MiB")
+                                    val encoding = response.header("Content-Encoding")
+                                    if (!encoding.isNullOrBlank() && !encoding.trim().equals("identity", true)) {
+                                        throw IOException("不支持的封面传输编码")
+                                    }
+                                    val type = response.header("Content-Type")?.substringBefore(';')?.trim()?.lowercase()
+                                    if (!type.isNullOrBlank() && !type.startsWith("image/") && type != "application/octet-stream") {
+                                        throw IOException("封面响应不是图片")
+                                    }
+                                    val output = ByteArrayOutputStream(8192)
+                                    val buffer = ByteArray(8192)
+                                    body.byteStream().use { input ->
+                                        while (true) {
+                                            continuation.context.ensureActive()
+                                            val count = input.read(buffer, 0, minOf(buffer.size, MAX_REMOTE_ARTWORK_BYTES - output.size() + 1))
+                                            continuation.context.ensureActive()
+                                            if (count < 0) break
+                                            if (output.size() + count > MAX_REMOTE_ARTWORK_BYTES) throw IOException("封面超过 2 MiB")
+                                            output.write(buffer, 0, count)
+                                        }
+                                    }
+                                    continuation.context.ensureActive()
+                                    continuation.resume(output.toByteArray())
+                                    return@suspendCancellableCoroutine
+                                }
+                            }
+                        } finally {
+                            inFlight.compareAndSet(call, null)
+                        }
+                    }
+                    throw IOException("封面重定向过多")
+                } catch (failure: Exception) {
+                    // Cancellation owns the continuation and closes the socket even during reads.
+                    if (continuation.isActive) continuation.resumeWithException(failure)
+                }
+            }
+        }
+    }
+
+    private fun checkedUrl(value: String): HttpUrl {
+        if (value.length > MAX_ARTWORK_URL_LENGTH) throw IOException("无效的封面地址")
+        val parsed = URL(value)
+        if (parsed.protocol != "https" && parsed.protocol != "http") throw IOException("不支持的封面协议")
+        if (parsed.host.isBlank() || parsed.userInfo != null) throw IOException("无效的封面地址")
+        return value.toHttpUrlOrNull() ?: throw IOException("无效的封面地址")
     }
 }

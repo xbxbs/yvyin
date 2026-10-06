@@ -13,6 +13,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import dev.chrisbanes.haze.HazeState
 
 /** Library landing and all-songs are distinct, state-preserving pages, not one endless feed. */
 @Composable
@@ -29,11 +30,14 @@ fun LibraryScreen(
     onShuffleList: (List<Track>) -> Unit = { onPlayList(it.shuffled()) },
     onPlaylists: () -> Unit = {}, playlistCount: Int = 0,
     onAddToPlaylist: (List<Track>) -> Unit = {},
-    onOpenSettings: () -> Unit = {},
+    backdrop: HazeState? = null,
+    backdropVisible: Boolean = true,
+    onScrollDirection: (Boolean) -> Unit = {},
 ) {
     var songsVisible by rememberSaveable { mutableStateOf(false) }
     val progress = remember { Animatable(if (songsVisible) 1f else 0f) }
     val songsPresent by remember { derivedStateOf { songsVisible || progress.value > .001f } }
+    val songsCovered by remember { derivedStateOf { progress.value >= .999f } }
     LaunchedEffect(songsVisible) {
         progress.animateTo(if (songsVisible) 1f else 0f, spring(dampingRatio = 1f, stiffness = 420f))
     }
@@ -48,7 +52,9 @@ fun LibraryScreen(
             onShuffleList = onShuffleList, showSongsOnly = songs, onSongs = { songsVisible = true },
             onRootBack = { songsVisible = false }, onPlaylists = onPlaylists, playlistCount = playlistCount,
             onAddToPlaylist = onAddToPlaylist,
-            onOpenSettings = onOpenSettings,
+            backdrop = backdrop,
+            backdropVisible = backdropVisible && (songs || !songsCovered),
+            onScrollDirection = onScrollDirection,
         )
     }
     Box(Modifier.fillMaxSize()) {

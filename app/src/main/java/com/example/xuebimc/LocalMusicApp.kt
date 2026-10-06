@@ -26,6 +26,8 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.saveable.rememberSaveableStateHolder
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -35,6 +37,7 @@ import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.TextStyle
@@ -74,6 +77,7 @@ internal fun LocalMusicApp(
     onImmersiveChange: (Boolean) -> Unit,
 ) {
     val context = LocalContext.current
+    val view = LocalView.current
     val focus = LocalFocusManager.current
     val keyboard = LocalSoftwareKeyboardController.current
     val repository = remember { LocalMusicRepository(context.applicationContext) }
@@ -90,11 +94,15 @@ internal fun LocalMusicApp(
     var message by remember { mutableStateOf<String?>(null) }
     var scanRevision by remember { mutableIntStateOf(0) }
     var playerVisible by remember { mutableStateOf(false) }
-    var onlineVisible by remember { mutableStateOf(false) }
-    var settingsVisible by remember { mutableStateOf(false) }
+    var selectedTab by rememberSaveable { mutableStateOf(MusicTab.Library) }
+    val onlineVisible = selectedTab == MusicTab.Online
+    val settingsVisible = selectedTab == MusicTab.Settings
+    val tabStates = rememberSaveableStateHolder()
+    var compactBar by remember { mutableStateOf(false) }
     var libraryOverlayVisible by remember { mutableStateOf(false) }
     var onlineOverlayVisible by remember { mutableStateOf(false) }
     var playlistOverlayVisible by remember { mutableStateOf(false) }
+    var settingsOverlayVisible by remember { mutableStateOf(false) }
     var playlistVisible by remember { mutableStateOf(false) }
     var playlistAddVisible by remember { mutableStateOf(false) }
     var playlistAddTracks by remember { mutableStateOf<List<Track>>(emptyList()) }
@@ -114,6 +122,14 @@ internal fun LocalMusicApp(
     var controlsVisible by remember { mutableStateOf(true) }
     var interactionRevision by remember { mutableIntStateOf(0) }
     val currentTrack = playback.currentTrack
+    fun selectTab(tab: MusicTab) {
+        focus.clearFocus()
+        keyboard?.hide()
+        if (selectedTab != tab) view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+        selectedTab = tab
+        compactBar = false
+        if (tab != MusicTab.Library) playlistVisible = false
+    }
     LaunchedEffect(library) { playback.setAutoplayLibrary(library) }
 
     LaunchedEffect(sheet) { sheet?.let { lastSheet = it } }
@@ -175,8 +191,9 @@ internal fun LocalMusicApp(
         focus.clearFocus()
         keyboard?.hide()
         playback.playTrack(track, queue, sourceName)
+        view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
         playerVisible = true
-        onlineVisible = false
+        selectedTab = MusicTab.Library
         lyricsVisible = false
         queueVisible = false
         sheet = null
@@ -197,6 +214,7 @@ internal fun LocalMusicApp(
         keyboard?.hide()
         playback.playTrack(track, queue.ifEmpty { listOf(track) },
             if (fromSaved) "在线歌单" else "${source.name}搜索")
+        view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
         playerVisible = true
         lyricsVisible = false
         queueVisible = false
@@ -297,9 +315,9 @@ internal fun LocalMusicApp(
             lyricsVisible && playerVisible -> lyricsVisible = false
             queueVisible && playerVisible -> queueVisible = false
             playerVisible -> playerVisible = false
-            settingsVisible -> settingsVisible = false
+            settingsVisible -> selectTab(MusicTab.Library)
             playlistVisible -> playlistVisible = false
-            else -> onlineVisible = false
+            else -> selectTab(MusicTab.Library)
         }
     }
 
@@ -316,7 +334,7 @@ internal fun LocalMusicApp(
     val settingsPresent by remember { derivedStateOf { settingsVisible || settingsProgress.value > .001f } }
     val settingsCovered by remember { derivedStateOf { settingsProgress.value >= .999f } }
     LaunchedEffect(settingsVisible) {
-        settingsProgress.animateTo(if (settingsVisible) 1f else 0f, spring(dampingRatio = 1f, stiffness = 420f))
+        settingsProgress.animateTo(if (settingsVisible) 1f else 0f, spring(dampingRatio = .85f, stiffness = 420f))
     }
     val playlistProgress = remember { Animatable(0f) }
     val playlistPresent by remember { derivedStateOf { playlistVisible || playlistProgress.value > .001f } }
@@ -324,6 +342,9 @@ internal fun LocalMusicApp(
         playlistProgress.animateTo(if (playlistVisible) 1f else 0f, spring(dampingRatio = 1f, stiffness = 420f))
     }
     val playerPresent by remember { derivedStateOf { playerVisible || playerDragging || playerProgress.value > 0.001f } }
+    val playerCovered by remember { derivedStateOf { playerExpansion() >= .999f } }
+    val onlineCovered by remember { derivedStateOf { onlineProgress.value >= .999f } }
+    val playlistCovered by remember { derivedStateOf { playlistProgress.value >= .999f } }
     val onlinePresent by remember { derivedStateOf { onlineVisible || onlineProgress.value > 0.001f } }
     LaunchedEffect(playerVisible, playerDragging) {
         if (playerDragging) return@LaunchedEffect
@@ -340,14 +361,19 @@ internal fun LocalMusicApp(
         )
     }
     LaunchedEffect(onlineVisible) {
-        onlineProgress.animateTo(if (onlineVisible) 1f else 0f, spring(dampingRatio = 1f, stiffness = 380f))
+        onlineProgress.animateTo(if (onlineVisible) 1f else 0f, spring(dampingRatio = .85f, stiffness = 380f))
     }
     val sheetCorner = RoundedCornerShape(28.dp)
     val bottomBackdrop = remember { HazeState() }
     var barHeight by remember { mutableStateOf(0.dp) }
-    val recordLibraryBackdrop = (!playerVisible || playerDragging) && !settingsCovered
+    val recordLibraryBackdrop = !playerCovered
 
     CompositionLocalProvider(LocalAnimatedBackground provides appPreferenceValues.animatedBackground) {
+    SharedArtworkTransition(
+        playerExpansion = playerExpansion,
+        enabled = !lyricsVisible && !queueVisible && sheet == null && !playlistAddVisible &&
+            !libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible && !settingsOverlayVisible,
+    ) {
     Box(Modifier.fillMaxSize().background(Color.Black).onSizeChanged { playerHeight = it.height.toFloat().coerceAtLeast(1f) }) {
         // Base world (library + online), receding like an iOS card while the player rises.
         Box(Modifier.fillMaxSize().graphicsLayer {
@@ -359,12 +385,12 @@ internal fun LocalMusicApp(
             shape = sheetCorner
             clip = p > 0.001f
         }.background(Color(0xFF0E0D11))) {
-        // The source contains pages only: never sample the glass itself or the player.
-        Box(Modifier.fillMaxSize().then(if (recordLibraryBackdrop) Modifier.hazeSource(bottomBackdrop) else Modifier)) {
+        // Page bodies are sources; no ancestor ever captures a header's own blur/scrim.
+        Box(Modifier.fillMaxSize()) {
         // Tabs cross-fade (they are siblings, not a push).
         Box(Modifier.fillMaxSize().graphicsLayer {
             val o = onlineProgress.value.coerceIn(0f, 1f)
-            alpha = if (o > 0.999f) 0f else 1f - o
+            alpha = (1f - o) * (1f - settingsProgress.value.coerceIn(0f, 1f))
         }) {
             LibraryScreen(
                 tracks = library,
@@ -388,7 +414,7 @@ internal fun LocalMusicApp(
                 onOpenPlayer = { if (playback.currentTrack != null) playerVisible = true },
                 onTogglePlayback = playback::togglePlayback,
                 onImport = { audioPicker.launch(arrayOf("audio/*")) },
-                onOnline = { onlineVisible = true },
+                onOnline = { selectTab(MusicTab.Online) },
                 onPlayList = { list -> list.firstOrNull()?.let { selectTrack(it, list) } },
                 onShuffleList = { tracks -> tracks.randomOrNull()?.let { first ->
                     selectTrack(first, tracks)
@@ -400,17 +426,23 @@ internal fun LocalMusicApp(
                 onSelectFromList = { track, tracks -> selectTrack(track, tracks) },
                 onOverlayVisibilityChange = { libraryOverlayVisible = it },
                 bottomInset = barHeight,
+                backdrop = bottomBackdrop,
+                backdropVisible = recordLibraryBackdrop && !onlineCovered && !settingsCovered && !playlistCovered,
+                onScrollDirection = { if (selectedTab == MusicTab.Library) compactBar = it },
                 isActive = !playerPresent && !onlineVisible && !playlistPresent && !settingsPresent && sheet == null && !playlistAddVisible,
                 onPlaylists = { playlistVisible = true },
                 playlistCount = savedPlaylists.size,
                 onAddToPlaylist = { playlistAddTracks = it; playlistAddVisible = true },
-                onOpenSettings = { focus.clearFocus(); keyboard?.hide(); settingsVisible = true },
             )
         }
         if (onlinePresent) Box(Modifier.fillMaxSize().graphicsLayer {
-            alpha = onlineProgress.value.coerceIn(0f, 1f)
-        }.background(Color(0xFF0E0D11)).pointerInput(Unit) { detectTapGestures { } }) {
+            alpha = onlineProgress.value.coerceIn(0f, 1f) * (1f - settingsProgress.value.coerceIn(0f, 1f))
+        }.background(Color.Black).then(if (recordLibraryBackdrop && !settingsCovered) Modifier.hazeSource(bottomBackdrop, zIndex = 2f) else Modifier)
+            .pointerInput(Unit) { detectTapGestures { } }) {
+            tabStates.SaveableStateProvider("online") {
             OnlineMusicScreen(
+                isPlaying = playback.playing && onlineVisible && !playerCovered && !settingsCovered,
+                onScrollDirection = { if (onlineVisible) compactBar = it },
                 isActive = onlineVisible && !playerPresent && !settingsPresent && !playlistPresent && !playlistAddVisible && sheet == null,
                 bottomInset = barHeight,
                 currentTrack = currentTrack,
@@ -421,7 +453,7 @@ internal fun LocalMusicApp(
                 saved = onlineSaved,
                 loading = onlineLoading,
                 error = onlineError,
-                onBack = { onlineVisible = false },
+                onBack = { selectTab(MusicTab.Library) },
                 onQueryChange = { onlineQuery = it },
                 onSourceChange = {
                     onlineSearchJob?.cancel()
@@ -472,12 +504,13 @@ internal fun LocalMusicApp(
                 },
                 onAddToPlaylist = { playlistAddTracks = it; playlistAddVisible = true },
                 onOverlayVisibilityChange = { onlineOverlayVisible = it },
-                onOpenSettings = { focus.clearFocus(); keyboard?.hide(); settingsVisible = true },
             )
+            }
         }
         if (playlistPresent) Box(Modifier.fillMaxSize().graphicsLayer {
             translationX = size.width * (1f - playlistProgress.value)
-        }.background(Color(0xFF0E0D11)).pointerInput(Unit) { detectTapGestures {} }) {
+        }.background(Color.Black).then(if (recordLibraryBackdrop && !settingsCovered) Modifier.hazeSource(bottomBackdrop, zIndex = 2f) else Modifier)
+            .pointerInput(Unit) { detectTapGestures {} }) {
             PlaylistScreen(
                 repository = playlists, library = library, currentTrack = currentTrack,
                 isPlaying = playback.playing, bottomInset = barHeight,
@@ -492,36 +525,39 @@ internal fun LocalMusicApp(
                 onOverlayVisibilityChange = { playlistOverlayVisible = it },
             )
         }
+        if (settingsPresent) Box(Modifier.fillMaxSize().graphicsLayer {
+            alpha = settingsProgress.value.coerceIn(0f, 1f)
+        }.background(Color.Black).then(if (recordLibraryBackdrop) Modifier.hazeSource(bottomBackdrop, zIndex = 3f) else Modifier)
+            .pointerInput(Unit) { detectTapGestures {} }) {
+            tabStates.SaveableStateProvider("settings") {
+                SettingsScreen(
+                    preferences = appPreferences, sources = onlineSources,
+                    hasAudioPermission = hasPermission, scanning = loading, bottomInset = barHeight,
+                    isActive = settingsVisible && !playerPresent,
+                    onOverlayVisibilityChange = { settingsOverlayVisible = it },
+                    onBack = { selectTab(MusicTab.Library) },
+                    onScan = { if (hasPermission) scanRevision++ else audioPermissionLauncher.launch(audioPermission()) },
+                    onOpenSystemSettings = {
+                        context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
+                    },
+                )
+            }
         }
-        if (!libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible) GlassTabBar(
+        }
+        if (!libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible && !settingsOverlayVisible) GlassTabBar(
             backdrop = bottomBackdrop,
             track = currentTrack,
             isPlaying = playback.playing,
-            onlineSelected = onlineVisible,
-            onSelectLibrary = { focus.clearFocus(); keyboard?.hide(); onlineVisible = false },
-            onSelectOnline = { focus.clearFocus(); keyboard?.hide(); playlistVisible = false; onlineVisible = true },
+            selectedTab = selectedTab,
+            onSelectTab = ::selectTab,
+            compact = compactBar && selectedTab != MusicTab.Settings,
+            onExpand = { compactBar = false },
             onOpenPlayer = { if (playback.currentTrack != null) playerVisible = true },
             onTogglePlayback = playback::togglePlayback,
             onNext = playback::next,
             onHeightChange = { barHeight = it },
             modifier = Modifier.align(Alignment.BottomCenter),
         )
-        }
-        if (settingsPresent) Box(Modifier.fillMaxSize().graphicsLayer {
-            translationX = size.width * (1f - settingsProgress.value)
-        }.background(Color.Black).pointerInput(Unit) { detectTapGestures {} }) {
-            SettingsScreen(
-                preferences = appPreferences,
-                sources = onlineSources,
-                hasAudioPermission = hasPermission,
-                scanning = loading,
-                bottomInset = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding(),
-                onBack = { settingsVisible = false },
-                onScan = { if (hasPermission) scanRevision++ else audioPermissionLauncher.launch(audioPermission()) },
-                onOpenSystemSettings = {
-                    context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
-                },
-            )
         }
         if (playerPresent && currentTrack != null) Box(Modifier.fillMaxSize().graphicsLayer {
             val p = playerExpansion().coerceIn(0f, 1f)
@@ -719,6 +755,7 @@ internal fun LocalMusicApp(
             SheetContents(if (kind == "more") "info" else kind)
         }
         PlaylistAddSheet(playlists, playlistAddTracks, playlistAddVisible) { playlistAddVisible = false }
+    }
     }
     }
 }

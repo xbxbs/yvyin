@@ -225,33 +225,20 @@ private fun ArtworkPlaceholder(modifier: Modifier) {
         val left = (size.width - side) / 2f
         val top = (size.height - side) / 2f
         fun point(x: Float, y: Float) = Offset(left + side * x, top + side * y)
-        val background = Brush.linearGradient(
-            colors = listOf(Color(0xFF403249), Color(0xFF292431), Color(0xFF19161F)),
-            start = Offset.Zero,
-            end = Offset(size.width.coerceAtLeast(1f), size.height.coerceAtLeast(1f)),
-        )
-        val haze = Brush.radialGradient(
-            colors = listOf(Color(0xFF806282).copy(alpha = .25f), Color.Transparent),
-            center = point(.23f, .22f),
-            radius = (side * .8f).coerceAtLeast(1f),
-        )
-        val beam = Path().apply {
-            moveTo(left + side * .43f, top + side * .33f)
-            lineTo(left + side * .68f, top + side * .25f)
-            lineTo(left + side * .68f, top + side * .34f)
-            lineTo(left + side * .43f, top + side * .42f)
+        val flag = Path().apply {
+            moveTo(left + side * .55f, top + side * .25f)
+            cubicTo(left + side * .55f, top + side * .36f,
+                left + side * .78f, top + side * .36f, left + side * .66f, top + side * .51f)
+            cubicTo(left + side * .70f, top + side * .40f,
+                left + side * .55f, top + side * .41f, left + side * .55f, top + side * .36f)
             close()
         }
-        val ink = Color(0xFFDBCCDD).copy(alpha = .64f)
+        val ink = Color(0xFFEBEBF5).copy(alpha = .40f)
         onDrawBehind {
-            drawRect(background)
-            drawRect(haze)
-            drawCircle(Color.White.copy(alpha = .025f), side * .37f, point(.5f, .5f))
-            drawPath(beam, ink)
-            drawLine(ink, point(.43f, .36f), point(.43f, .68f), side * .032f, StrokeCap.Round)
-            drawLine(ink, point(.68f, .28f), point(.68f, .60f), side * .032f, StrokeCap.Round)
-            drawOval(ink, point(.28f, .63f), Size(side * .16f, side * .11f))
-            drawOval(ink, point(.53f, .55f), Size(side * .16f, side * .11f))
+            drawRect(Color(0xFF2C2C2E))
+            drawPath(flag, ink)
+            drawLine(ink, point(.55f, .27f), point(.55f, .66f), side * .042f, StrokeCap.Round)
+            drawOval(ink, point(.33f, .59f), Size(side * .24f, side * .16f))
         }
     })
 }
@@ -283,6 +270,7 @@ private data class CachedArtwork(
     val palette: ArtworkPalette,
     val byteCount: Int,
     val loadedAt: Long = SystemClock.uptimeMillis(),
+    val retryAfterMs: Long = 30_000L,
 )
 
 @Composable
@@ -329,7 +317,6 @@ private fun rememberMusicArtwork(track: Track?, requestSize: Int): CachedArtwork
 
 private object MusicArtworkCache {
     private const val CACHE_BYTES = 12 * 1024 * 1024
-    private const val MISS_LIFETIME_MS = 30_000L
     // Serial decoding also coalesces simultaneous cover/backdrop requests after a cache recheck.
     private val decodeMutex = Mutex()
     val updates = MutableStateFlow(0L)
@@ -343,7 +330,7 @@ private object MusicArtworkCache {
     fun peek(key: ArtworkKey): CachedArtwork? = lookup(key, allowSmaller = true)
 
     fun retryDelayMillis(artwork: CachedArtwork): Long =
-        (MISS_LIFETIME_MS - (SystemClock.uptimeMillis() - artwork.loadedAt)).coerceAtLeast(0L)
+        (artwork.retryAfterMs - (SystemClock.uptimeMillis() - artwork.loadedAt)).coerceAtLeast(0L)
 
     private fun lookup(key: ArtworkKey, allowSmaller: Boolean): CachedArtwork? = synchronized(cache) {
         var size = key.size
@@ -353,7 +340,7 @@ private object MusicArtworkCache {
             val entry = cache.get(candidate)
             if (entry != null) {
                 if (entry.image != null) return@synchronized entry
-                if (SystemClock.uptimeMillis() - entry.loadedAt >= MISS_LIFETIME_MS) {
+                if (SystemClock.uptimeMillis() - entry.loadedAt >= entry.retryAfterMs) {
                     cache.remove(candidate)
                 } else if (size == key.size) {
                     miss = entry
@@ -391,6 +378,9 @@ private object MusicArtworkCache {
         }
 
     private suspend fun read(context: Context, track: Track, size: Int): CachedArtwork {
+        // Remote timeouts should recover promptly when searching again. Local missing tags
+        // retain the longer TTL; both paths still make at most one automatic UI retry.
+        val retryAfterMs = if (track.isOnline || track.artworkUri?.scheme in setOf("http", "https")) 2_000L else 30_000L
         return try {
             val source = repository ?: LocalMusicRepository(context.applicationContext).also { repository = it }
             val bitmap = source.loadArtwork(track, size)?.let { fitArtwork(it, size) }
@@ -399,12 +389,14 @@ private object MusicArtworkCache {
                 image = bitmap?.asImageBitmap(),
                 palette = bitmap?.let(::sampleArtworkPalette) ?: DefaultArtworkPalette,
                 byteCount = bitmap?.allocationByteCount ?: 0,
+                retryAfterMs = retryAfterMs,
             )
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (_: Exception) {
             // Missing files, revoked permissions, or malformed art should leave a quiet placeholder.
-            CachedArtwork(null, DefaultArtworkPalette, 0)
+            currentCoroutineContext().ensureActive()
+            CachedArtwork(null, DefaultArtworkPalette, 0, retryAfterMs = retryAfterMs)
         }
     }
 }

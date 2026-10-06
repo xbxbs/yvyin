@@ -59,11 +59,7 @@ internal data class OnlineSearchReceipt(val sourceId: String, val query: String,
 class OnlineMusicRepository(context: Context) {
     private val context = context.applicationContext
     private val preferences = this.context.getSharedPreferences("online_library", Context.MODE_PRIVATE)
-    private val artworkRequests = Semaphore(3)
     private val activeSearch = AtomicReference<Job?>()
-    private val artworkCache = object : LinkedHashMap<String, Uri>(64, .75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Uri>?): Boolean = size > 128
-    }
     val builtInSources: List<OnlineSource> = listOf(
         OnlineSource("kw", "酷我", supportsPlayback = true, supportsDownload = true,
             description = "标准音质 · 以来源实际权限为准"),
@@ -121,7 +117,15 @@ class OnlineMusicRepository(context: Context) {
                 "mg" -> searchMigu(keyword)
                 else -> emptyList()
             }
-            val ranked = rankSearchResults(tracks.distinctBy { it.stableKey }, keyword)
+            request.ensureActive()
+            val ranked = rankSearchResults(tracks.distinctBy { it.stableKey }, keyword).map { track ->
+                // Search and visible-row enrichment use different repository instances. Reuse
+                // only same-provider, same-ID metadata; never discard a cover on a repeat search.
+                synchronized(artworkCache) {
+                    track.artworkUri?.let { artworkCache[track.stableKey] = it }
+                    if (track.artworkUri != null) track else track.copy(artworkUri = artworkCache[track.stableKey])
+                }
+            }
             synchronized(activeSearch) {
                 request.ensureActive()
                 if (activeSearch.get() !== request) throw CancellationException("搜索请求已更新")
@@ -195,9 +199,12 @@ class OnlineMusicRepository(context: Context) {
             "keyword" to keyword, "page" to "1", "pagesize" to "30", "showtype" to "1")
         if (root.optInt("status") != 1) throw IOException("酷狗搜索暂不可用（${root.optInt("errcode")}）")
         return objects(root.optJSONObject("data")?.optJSONArray("info")).mapNotNull { item ->
+            val cover = listOf(item.optJSONObject("trans_param")?.optString("union_cover").orEmpty(),
+                item.optString("pic"), item.optString("album_img"), item.optString("imgUrl"))
+                .firstNotNullOfOrNull(::artwork)
             makeTrack("kg", item.optString("hash").lowercase(Locale.ROOT), item.optString("songname"),
                 item.optString("singername"), item.optString("album_name"), item.optLong("duration") * 1000,
-                item.optJSONObject("trans_param")?.optString("union_cover").orEmpty().ifBlank { item.optString("pic") })
+                cover?.toString().orEmpty())
         }
     }
 
@@ -482,7 +489,11 @@ class OnlineMusicRepository(context: Context) {
 
     /** Also used lazily by visible legacy saved rows, which predate artworkUri persistence. */
     suspend fun resolveArtwork(track: Track): Track = withContext(Dispatchers.IO) {
-        if (track.artworkUri != null || !track.isOnline || !validId(track.sourceId.orEmpty(), track.sourceTrackId.orEmpty())) return@withContext track
+        if (!track.isOnline || !validId(track.sourceId.orEmpty(), track.sourceTrackId.orEmpty())) return@withContext track
+        if (track.artworkUri != null) {
+            synchronized(artworkCache) { artworkCache[track.stableKey] = track.artworkUri }
+            return@withContext track
+        }
         val cover = synchronized(artworkCache) { artworkCache[track.stableKey] } ?: artworkRequests.withPermit {
             // A visible row may have finished while this request waited for its permit.
             synchronized(artworkCache) { artworkCache[track.stableKey] } ?: optionalMetadata { resolveCover(track) }.also { resolved ->
@@ -504,7 +515,9 @@ class OnlineMusicRepository(context: Context) {
             "kg" -> {
                 val info = jsonGet("https://m.kugou.com/app/i/getSongInfo.php", "cmd" to "playInfo", "hash" to id)
                 if (!info.optString("hash").equals(id, true) && !info.optString("req_hash").equals(id, true)) null
-                else artwork(info.optString("album_img").ifBlank { info.optString("imgUrl") })
+                // Playback can be pay-restricted while public artwork is still present. Keep
+                // the hash check, but don't gate a cover on playInfo's audio status or URL.
+                else listOf("album_img", "imgUrl").firstNotNullOfOrNull { artwork(info.optString(it)) }
             }
             "wy" -> {
                 val songs = jsonGet("https://music.163.com/api/song/detail", "ids" to JSONArray(listOf(id)).toString()).optJSONArray("songs")
@@ -668,6 +681,12 @@ class OnlineMusicRepository(context: Context) {
 
     companion object {
         const val CONFIG_URL = "https://13413.kstore.vip/QingMusic/music.json"
+        // Shared across search, rows and now-playing metadata. Successes only: neither a
+        // cancellation nor a temporary provider error can poison later searches.
+        private val artworkRequests = Semaphore(3)
+        private val artworkCache = object : LinkedHashMap<String, Uri>(64, .75f, true) {
+            override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Uri>?): Boolean = size > 128
+        }
         // The host's List<Track> callback has no query/source token. Publish an immutable receipt as well,
         // so leaving the screen, editing a query or receiving equal lists cannot mislabel an older result.
         private val latestSearchReceipt = MutableStateFlow<OnlineSearchReceipt?>(null)

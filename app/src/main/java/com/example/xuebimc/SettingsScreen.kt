@@ -60,8 +60,8 @@ import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 
-private val SettingsAccent = Color(0xFFFA586A)
-private val SettingsSecondary = Color.White.copy(alpha = .58f)
+private val SettingsAccent = Color(0xFFFA2D48)
+private val SettingsSecondary = Color(0xFFEBEBF5).copy(alpha = .6f)
 
 @Composable
 fun SettingsScreen(
@@ -73,6 +73,8 @@ fun SettingsScreen(
     onBack: () -> Unit,
     onScan: () -> Unit,
     onOpenSystemSettings: () -> Unit,
+    isActive: Boolean = true,
+    onOverlayVisibilityChange: (Boolean) -> Unit = {},
 ) {
     val values by preferences.values.collectAsState()
     val context = LocalContext.current
@@ -83,6 +85,7 @@ fun SettingsScreen(
     var showSources by remember { mutableStateOf(false) }
     var showLicenses by rememberSaveable { mutableStateOf(false) }
     val sourceAnchor = rememberMenuAnchor()
+    LaunchedEffect(isActive) { if (!isActive) showSources = false }
     val selectedSource = sources.firstOrNull { it.id == values.defaultOnlineSource }
     val sourceSummary = when {
         selectedSource == null -> "${values.defaultOnlineSource} · 当前不可用"
@@ -92,16 +95,18 @@ fun SettingsScreen(
     }
 
     if (showLicenses) {
-        SettingsLicenses(bottomInset, onBack = { showLicenses = false })
+        SettingsLicenses(bottomInset, onBack = { showLicenses = false }, isActive = isActive)
         return
     }
-    BackHandler(enabled = !showSources, onBack = onBack)
+    BackHandler(enabled = isActive && !showSources, onBack = onBack)
     LazyColumn(
         modifier = Modifier.fillMaxSize().background(Color.Black).statusBarsPadding(),
         contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = bottomInset + 24.dp),
         verticalArrangement = Arrangement.spacedBy(20.dp),
     ) {
-        item(key = "settings:header") { SettingsHeader("设置", onBack) }
+        item(key = "settings:header") {
+            SettingsText("设置", Modifier.padding(bottom = 4.dp), size = 34.sp, bold = true)
+        }
         item(key = "settings:appearance") {
             SettingsGroup("外观与显示") {
                 SettingsToggle("动态背景", "跟随封面缓慢流动；关闭后保持静态。", values.animatedBackground,
@@ -153,9 +158,10 @@ fun SettingsScreen(
         }
     }
     AppContextMenu(
-        visible = showSources,
+        visible = showSources && isActive,
         anchor = null,
         onDismiss = { showSources = false },
+        onShowingChanged = onOverlayVisibilityChange,
         header = {
             Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 SettingsText("默认搜索音源", medium = true)
@@ -264,16 +270,19 @@ private fun SettingsText(
     color: Color = Color.White,
     medium: Boolean = false,
     maxLines: Int = Int.MAX_VALUE,
+    bold: Boolean = false,
 ) {
     BasicText(text, modifier, maxLines = maxLines, overflow = TextOverflow.Ellipsis, style = TextStyle(
         color = color, fontSize = size, lineHeight = size * 1.4f,
-        fontFamily = PlayerTypography.familyFor(text, medium), fontSynthesis = FontSynthesis.None,
+        fontFamily = if (bold) PlayerTypography.bold else PlayerTypography.familyFor(text, medium),
+        fontWeight = if (bold) androidx.compose.ui.text.font.FontWeight.Bold else androidx.compose.ui.text.font.FontWeight.Normal,
+        fontSynthesis = FontSynthesis.None,
         platformStyle = PlatformTextStyle(includeFontPadding = false),
     ))
 }
 
 @Composable
-private fun SettingsLicenses(bottomInset: Dp, onBack: () -> Unit) {
+private fun SettingsLicenses(bottomInset: Dp, onBack: () -> Unit, isActive: Boolean) {
     val context = LocalContext.current.applicationContext
     var selectedFile by rememberSaveable { mutableStateOf<String?>(null) }
     var reload by remember { mutableStateOf(0) }
@@ -281,7 +290,7 @@ private fun SettingsLicenses(bottomInset: Dp, onBack: () -> Unit) {
     var failure by remember(selectedFile) { mutableStateOf<String?>(null) }
     var entries by remember(selectedFile) { mutableStateOf(emptyList<String>()) }
     val goBack: () -> Unit = { if (selectedFile != null) selectedFile = null else onBack() }
-    BackHandler(onBack = goBack)
+    BackHandler(enabled = isActive, onBack = goBack)
     LaunchedEffect(context, selectedFile, reload) {
         loading = true
         failure = null

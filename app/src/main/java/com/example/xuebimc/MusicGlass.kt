@@ -35,8 +35,8 @@ internal fun Modifier.musicGlassSurface(backdrop: HazeState, shape: Shape): Modi
     val style = remember {
         HazeStyle(
             backgroundColor = GlassPageBackground,
-            tints = listOf(HazeTint(Color.White.copy(alpha = .06f))),
-            blurRadius = 24.dp,
+            tints = listOf(HazeTint(Color.White.copy(alpha = .08f))),
+            blurRadius = 32.dp,
             noiseFactor = 0f,
             fallbackTint = HazeTint(GlassPageBackground.copy(alpha = .94f)),
         )
@@ -44,7 +44,8 @@ internal fun Modifier.musicGlassSurface(backdrop: HazeState, shape: Shape): Modi
     val rim = remember {
         Brush.verticalGradient(listOf(Color.White.copy(alpha = .16f), Color.White.copy(alpha = .03f)))
     }
-    return clip(shape).border(1.dp, rim, shape).hazeEffect(backdrop, style)
+    val hairline = with(LocalDensity.current) { .5f.toDp() }
+    return clip(shape).border(hairline, rim, shape).hazeEffect(backdrop, style)
 }
 
 /** Blur radius fades toward the body; a separate opaque scrim protects header text. */
@@ -96,9 +97,12 @@ internal fun MusicHeaderGlass(
                     drawRect(scrim)
                 }
             }
-            .then(if (enabled) Modifier.hazeEffect(backdrop, style) {
+            .hazeEffect(backdrop, style) {
+                // Do not detach/recreate the effect while its independent scrim remains drawn.
+                // The page owner disables sampling only after the page is fully covered.
+                blurEnabled = enabled
                 inputScale = HazeInputScale.None
                 progressive = progressiveBlur
-            } else Modifier),
+            },
     )
 }

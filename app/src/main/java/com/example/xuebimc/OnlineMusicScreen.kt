@@ -1,5 +1,7 @@
 package com.example.xuebimc
 
+import androidx.compose.foundation.shape.RoundedCornerShape
+
 import android.content.Intent
 import android.widget.Toast
 import androidx.compose.foundation.Canvas
@@ -13,7 +15,6 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
-import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
@@ -23,14 +24,9 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
-import androidx.compose.foundation.selection.selectable
 import androidx.compose.foundation.selection.selectableGroup
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
-import androidx.compose.foundation.text.BasicTextField
-import androidx.compose.foundation.text.KeyboardActions
-import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
@@ -45,7 +41,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
@@ -53,27 +48,24 @@ import androidx.compose.ui.platform.LocalFocusManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.semantics.LiveRegionMode
-import androidx.compose.ui.semantics.ProgressBarRangeInfo
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.clearAndSetSemantics
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.liveRegion
-import androidx.compose.ui.semantics.progressBarRangeInfo
-import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
-import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontSynthesis
-import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
-private val OnlineSecondary = Color.White.copy(alpha = .58f)
-private val OnlineAccent = Color(0xFFFA586A)
+internal val OnlineSecondary = Color(0xFFEBEBF5).copy(alpha = .6f)
+internal val OnlineTertiary = Color(0xFFEBEBF5).copy(alpha = .3f)
+internal val OnlineAccent = Color(0xFFFA2D48)
+internal val OnlineControlSurface = Color(0xFF1C1C1E)
 
 @Composable
 fun OnlineMusicScreen(
@@ -97,12 +89,15 @@ fun OnlineMusicScreen(
     onAddToPlaylist: (List<Track>) -> Unit = {},
     onOverlayVisibilityChange: (Boolean) -> Unit = {},
     onPlayFromList: (Track, List<Track>, Boolean) -> Unit = { track, _, _ -> onPlay(track) },
-    onOpenSettings: () -> Unit = {},
     isActive: Boolean = true,
+    isPlaying: Boolean = false,
+    onScrollDirection: (Boolean) -> Unit = {},
 ) {
     var showSaved by rememberSaveable { mutableStateOf(false) }
     val resultsState = rememberLazyListState()
     val savedState = rememberLazyListState()
+    val listState = if (showSaved) savedState else resultsState
+    OnlineScrollDirectionEffect(listState, isActive, onScrollDirection)
     val enabledSources = remember(sources) { sources.filter { it.enabled } }
     val sourceById = remember(sources) { sources.associateBy { it.id } }
     val savedKeys = remember(saved) { saved.mapTo(HashSet()) { it.stableKey } }
@@ -121,6 +116,9 @@ fun OnlineMusicScreen(
     val visibleTracks = if (showSaved) saved
         else if (resultMatchesInput && hasCurrentResults && !loading && !searchPending && !searchFailed) sourceResults else emptyList()
     val context = LocalContext.current
+    val recentSearchStore = remember(context.applicationContext) { OnlineRecentSearchStore(context.applicationContext) }
+    var recentSearches by remember(recentSearchStore) { mutableStateOf(recentSearchStore.load()) }
+    var recentSearchRequest by remember { mutableStateOf<Pair<String, String>?>(null) }
     val artworkRepository = remember(context.applicationContext) { OnlineMusicRepository(context.applicationContext) }
     val keyboard = LocalSoftwareKeyboardController.current
     val focus = LocalFocusManager.current
@@ -143,16 +141,27 @@ fun OnlineMusicScreen(
     val hideKeyboard: () -> Unit = { keyboard?.hide(); focus.clearFocus() }
     val menuAction: (() -> Unit) -> Unit = { action -> afterDismiss = action; menuVisible = false }
     val submitSearch: () -> Unit = {
+        hideKeyboard()
         if (canSearch) {
-            hideKeyboard()
             submittedQuery = query.trim()
             submittedSource = selectedSourceId
             showSaved = false
             searchPending = true
             searchFailed = false
+            recentSearches = recentSearchStore.record(submittedQuery, recentSearches)
             // Search retries must capture the current query/source and refresh the submission state.
             retryAction = null
             onSearch()
+        }
+    }
+    LaunchedEffect(recentSearchRequest, query, selectedSourceId, canSearch) {
+        val request = recentSearchRequest ?: return@LaunchedEffect
+        if (request.second != selectedSourceId) {
+            recentSearchRequest = null
+        } else if (query.trim() == request.first && canSearch) {
+            // Wait for the host to receive the new query before invoking its search closure.
+            recentSearchRequest = null
+            submitSearch()
         }
     }
     LaunchedEffect(loading, searchPending, error) {
@@ -173,65 +182,50 @@ fun OnlineMusicScreen(
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black)) {
-        // Never observe scroll offsets in the screen; LazyColumn owns scrolling.
+        // Scroll observation stays inside an effect, never the screen's composition.
         LazyColumn(
-            state = if (showSaved) savedState else resultsState,
+            state = listState,
             modifier = Modifier.fillMaxSize().statusBarsPadding().imePadding(),
             contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = bottomInset + 24.dp),
         ) {
             item(key = "online:heading", contentType = "heading") {
                 Row(Modifier.fillMaxWidth().padding(bottom = 12.dp), verticalAlignment = Alignment.CenterVertically) {
                     OnlineText("在线", Modifier.weight(1f), size = 34.sp, bold = true)
-                    Box(
-                        Modifier.size(48.dp).clip(CircleShape).clickable(role = Role.Button) {
-                            hideKeyboard()
-                            onOpenSettings()
-                        }.semantics { contentDescription = "打开设置" },
-                        contentAlignment = Alignment.Center,
-                    ) {
-                        PlayerIcon(PlayerIconType.Settings, Modifier.size(23.dp), tint = OnlineAccent)
-                    }
                 }
             }
             item(key = "online:search", contentType = "search") {
-                OnlineSearchField(query, { value ->
-                    if (value != query) retryAction = null
-                    onQueryChange(value)
-                }, canSearch, loading, submitSearch)
-            }
-            item(key = "online:source", contentType = "source") {
-                Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                    Row(
-                        Modifier.weight(1f).then(sourceAnchor.first).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp))
-                            .clickable(role = Role.Button, onClickLabel = "选择搜索音源") {
-                                hideKeyboard(); sourceAnchor.second(); sourceMenu = true
-                                showSourceDetails = false; menuTrack = null; menuVisible = true
-                            }.padding(horizontal = 4.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                    ) {
-                        OnlineText("搜索音源", size = 12.sp, color = OnlineSecondary)
-                        Spacer(Modifier.width(8.dp))
-                        OnlineText(selectedSource?.name ?: "不可用", Modifier.weight(1f, fill = false),
-                            size = 13.sp, color = OnlineAccent, medium = true)
-                        Spacer(Modifier.width(6.dp))
-                        OnlineGlyph(OnlineSymbol.Chevron, Modifier.size(12.dp), OnlineSecondary)
-                    }
-                    Box(
-                        Modifier.then(sourceInfoAnchor.first).heightIn(min = 48.dp).clip(RoundedCornerShape(8.dp)).clickable(role = Role.Button) {
-                            hideKeyboard(); sourceInfoAnchor.second(); sourceMenu = true
-                            showSourceDetails = true; menuTrack = null; menuVisible = true
-                        }.padding(horizontal = 8.dp),
-                        contentAlignment = Alignment.Center,
-                    ) { OnlineText("音源信息", size = 12.sp, color = OnlineSecondary) }
-                }
+                OnlineSearchField(
+                    query = query,
+                    onQueryChange = { value ->
+                        recentSearchRequest = null
+                        if (value != query) retryAction = null
+                        onQueryChange(value)
+                    },
+                    onSearch = submitSearch,
+                    onCancel = hideKeyboard,
+                    sourceName = selectedSource?.name ?: "不可用",
+                    sourceModifier = sourceAnchor.first,
+                    onSourceClick = {
+                        hideKeyboard(); sourceAnchor.second(); sourceMenu = true
+                        showSourceDetails = false; menuTrack = null; menuVisible = true
+                    },
+                )
             }
             item(key = "online:tabs", contentType = "tabs") {
-                Row(
-                    Modifier.padding(top = 4.dp, bottom = 8.dp).fillMaxWidth().selectableGroup()
-                        .clip(RoundedCornerShape(12.dp)).background(Color.White.copy(alpha = .055f)),
-                ) {
-                    OnlineTab("搜索结果", !showSaved, { hideKeyboard(); showSaved = false }, Modifier.weight(1f))
-                    OnlineTab("在线歌单", showSaved, { hideKeyboard(); showSaved = true }, Modifier.weight(1f))
+                Row(Modifier.fillMaxWidth().padding(bottom = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                    OnlineSegmentedControl(
+                        showSaved = showSaved,
+                        onSelect = { savedTab -> hideKeyboard(); showSaved = savedTab },
+                        modifier = Modifier.weight(1f),
+                    )
+                    Spacer(Modifier.width(8.dp))
+                    Box(
+                        Modifier.then(sourceInfoAnchor.first).size(48.dp).clip(CircleShape).clickable(role = Role.Button) {
+                            hideKeyboard(); sourceInfoAnchor.second(); sourceMenu = true
+                            showSourceDetails = true; menuTrack = null; menuVisible = true
+                        }.semantics { contentDescription = "音源信息" },
+                        contentAlignment = Alignment.Center,
+                    ) { PlayerIcon(PlayerIconType.Info, Modifier.size(21.dp), tint = OnlineSecondary) }
                 }
             }
             if (!error.isNullOrBlank()) {
@@ -251,10 +245,10 @@ fun OnlineMusicScreen(
                     }
                 }
             }
-            if (showSaved || loading || searchPending || (resultMatchesInput && hasCurrentResults && !searchFailed)) {
+            if (showSaved || (query.isNotBlank() && resultMatchesInput && hasCurrentResults && !loading && !searchPending && !searchFailed)) {
               item(key = "online:count", contentType = "section") {
                 Row(
-                    Modifier.fillMaxWidth().padding(top = 8.dp, bottom = 6.dp),
+                    Modifier.fillMaxWidth().padding(start = 60.dp, top = 8.dp, bottom = 6.dp),
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
@@ -265,19 +259,26 @@ fun OnlineMusicScreen(
                         else "",
                         Modifier.weight(1f), size = 13.sp, color = OnlineSecondary,
                     )
-                    if (loading || searchPending) {
-                        OnlineText(
-                            "正在加载…", size = 12.sp, color = OnlineSecondary,
-                            modifier = Modifier.semantics {
-                                liveRegion = LiveRegionMode.Polite
-                                progressBarRangeInfo = ProgressBarRangeInfo.Indeterminate
-                            },
-                        )
-                    }
                 }
               }
             }
-            if (visibleTracks.isEmpty()) {
+            if (!showSaved && query.isBlank()) {
+                item(key = "online:recent", contentType = "recent") {
+                    OnlineRecentSearches(
+                        queries = recentSearches,
+                        canSearch = selectedSource != null,
+                        onClear = { recentSearchStore.clear(); recentSearches = emptyList() },
+                        onSelect = { recent ->
+                            hideKeyboard()
+                            retryAction = null
+                            recentSearchRequest = recent to selectedSourceId
+                            onQueryChange(recent)
+                        },
+                    )
+                }
+            } else if (!showSaved && resultMatchesInput && (loading || searchPending)) {
+                item(key = "online:loading", contentType = "loading") { OnlineSearchSkeleton() }
+            } else if (visibleTracks.isEmpty()) {
                 item(key = "online:empty", contentType = "empty") {
                     val title = when {
                         showSaved -> "在线歌单还是空的"
@@ -289,7 +290,7 @@ fun OnlineMusicScreen(
                         searchFailed -> "暂未取得结果"
                         !error.isNullOrBlank() -> "暂未取得结果"
                         !hasCurrentResults -> "搜索喜欢的音乐"
-                        else -> "暂无搜索结果"
+                        else -> "没有找到“${submittedQuery}”的结果"
                     }
                     val message = when {
                         showSaved -> "在歌曲的 … 菜单中保存；不会自动下载。"
@@ -299,7 +300,7 @@ fun OnlineMusicScreen(
                         query.isBlank() || !resultMatchesInput -> "输入歌名、歌手或专辑。"
                         !error.isNullOrBlank() -> "可重试，或在搜索框下方切换音源。"
                         !hasCurrentResults -> "关键词或来源已更改，请重新搜索。"
-                        else -> "试试其他关键词或音源。"
+                        else -> "试试切换音源"
                     }
                     OnlineEmptyState(title, message)
                 }
@@ -314,6 +315,7 @@ fun OnlineMusicScreen(
                         onPlay = playTrack,
                         onMenu = { hideKeyboard(); sourceMenu = false; menuTrack = it; menuVisible = true },
                         showSource = showSaved,
+                        isPlaying = isPlaying && track.stableKey == currentKey,
                     )
                 }
             }
@@ -334,10 +336,19 @@ fun OnlineMusicScreen(
                 }
             },
             header = {
-                Column(Modifier.padding(horizontal = 16.dp, vertical = 12.dp)) {
-                    OnlineText(if (sourceMenu) { if (showSourceDetails) "音源信息" else "搜索音源" }
-                        else menuTrack?.title.orEmpty(), size = 15.sp, medium = true)
-                    if (!sourceMenu) OnlineText(menuTrack?.artist.orEmpty(), size = 12.sp, color = OnlineSecondary)
+                if (sourceMenu) {
+                    OnlineText(if (showSourceDetails) "音源信息" else "搜索音源",
+                        Modifier.padding(horizontal = 16.dp, vertical = 12.dp), size = 15.sp, medium = true)
+                } else menuTrack?.let { preview ->
+                    Row(Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        TrackArtwork(preview, Modifier.size(48.dp).clip(RoundedCornerShape(6.dp)), requestSize = 128)
+                        Spacer(Modifier.width(12.dp))
+                        Column(Modifier.weight(1f)) {
+                            OnlineText(preview.title, size = 17.sp, maxLines = 2)
+                            OnlineText(preview.artist, size = 15.sp, color = OnlineSecondary)
+                        }
+                    }
                 }
             },
         ) {
@@ -352,14 +363,14 @@ fun OnlineMusicScreen(
                 SheetActionRow("选择搜索音源", PlayerIconType.Info) { showSourceDetails = false }
             } else if (sourceMenu) {
                 if (sources.isEmpty()) OnlineText("暂无可用音源", Modifier.padding(16.dp), color = OnlineSecondary)
-                sources.forEachIndexed { index, source ->
-                    if (index > 0) SheetActionDivider()
-                    if (source.enabled) {
-                        SheetActionRow(source.name + (if (source.supportsPlayback) "" else " · 仅搜索") +
-                            (if (source.id == selectedSourceId) " · 当前" else ""), PlayerIconType.Info, onClick = {
+                Column(Modifier.selectableGroup()) {
+                    sources.forEachIndexed { index, source ->
+                        if (index > 0) SheetActionDivider()
+                        OnlineSourceOption(source, selected = source.id == selectedSourceId) {
                                 menuAction {
                                     showSaved = false
                                     if (source.id != selectedSourceId) {
+                                        recentSearchRequest = null
                                         submittedSource = ""
                                         searchPending = false
                                         searchFailed = false
@@ -367,11 +378,6 @@ fun OnlineMusicScreen(
                                         onSourceChange(source.id)
                                     }
                                 }
-                            })
-                    } else {
-                        Column(Modifier.fillMaxWidth().heightIn(min = 48.dp).padding(horizontal = 16.dp, vertical = 8.dp)) {
-                            OnlineText("${source.name} · 未启用", size = 15.sp, color = OnlineSecondary)
-                            OnlineText(source.description.ifBlank { "配置未启用" }, size = 11.sp, color = OnlineSecondary, maxLines = 2)
                         }
                     }
                 }
@@ -418,87 +424,20 @@ fun OnlineMusicScreen(
 }
 
 @Composable
-private fun OnlineSearchField(
-    query: String,
-    onQueryChange: (String) -> Unit,
-    canSearch: Boolean,
-    loading: Boolean,
-    onSearch: () -> Unit,
-) {
-        Row(
-            Modifier.fillMaxWidth().heightIn(min = 48.dp).clip(RoundedCornerShape(11.dp))
-                .background(Color.White.copy(alpha = .085f)).padding(start = 14.dp),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            BasicTextField(
-                value = query,
-                onValueChange = onQueryChange,
-                modifier = Modifier.weight(1f).padding(vertical = 12.dp)
-                    .semantics { contentDescription = "搜索在线歌曲、歌手或专辑" },
-                singleLine = true,
-                textStyle = TextStyle(
-                    color = Color.White, fontSize = 16.sp, fontFamily = PlayerTypography.familyFor(query),
-                    platformStyle = PlatformTextStyle(includeFontPadding = false),
-                ),
-                cursorBrush = SolidColor(OnlineAccent),
-                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Search),
-                keyboardActions = KeyboardActions(onSearch = { onSearch() }),
-                decorationBox = { field ->
-                    Box(contentAlignment = Alignment.CenterStart) {
-                        if (query.isEmpty()) OnlineText("歌名、歌手或专辑", size = 15.sp, color = OnlineSecondary)
-                        field()
-                    }
-                },
-            )
-            if (query.isNotEmpty()) {
-                OnlineIconButton(OnlineSymbol.Clear, "清除搜索", { onQueryChange("") })
-            }
-            OnlineIconButton(OnlineSymbol.Search, if (loading && !canSearch) "搜索中" else "搜索", onSearch,
-                enabled = canSearch, color = OnlineAccent)
-        }
-}
-
-@Composable
-private fun OnlineTab(label: String, active: Boolean, onClick: () -> Unit, modifier: Modifier) {
-    Box(
-        modifier.heightIn(min = 48.dp)
-            .selectable(selected = active, role = Role.Tab, onClick = onClick)
-            .padding(horizontal = 2.dp),
-        contentAlignment = Alignment.Center,
-    ) {
-        OnlineText(label, size = 15.sp, color = if (active) OnlineAccent else OnlineSecondary, medium = active)
-        if (active) Box(Modifier.align(Alignment.BottomCenter).width(24.dp).height(2.dp)
-            .clip(RoundedCornerShape(1.dp)).background(OnlineAccent))
-    }
-}
-
-@Composable
 private fun OnlineEmptyState(title: String, message: String) {
     Column(
         Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
         verticalArrangement = Arrangement.spacedBy(14.dp),
     ) {
-        OnlineGlyph(OnlineSymbol.Search, Modifier.size(32.dp), OnlineSecondary)
+        OnlineGlyph(OnlineSymbol.Search, Modifier.size(52.dp), OnlineTertiary)
         OnlineText(title, size = 20.sp, medium = true, maxLines = 2, align = TextAlign.Center)
         OnlineText(message, size = 14.sp, color = OnlineSecondary, maxLines = 4, align = TextAlign.Center)
     }
 }
 
 @Composable
-private fun OnlineIconButton(symbol: OnlineSymbol, label: String, onClick: () -> Unit,
-                             modifier: Modifier = Modifier, enabled: Boolean = true, color: Color = OnlineSecondary) {
-    Box(
-        modifier.size(48.dp).clip(CircleShape).clickable(enabled = enabled, role = Role.Button, onClick = onClick)
-            .semantics { contentDescription = label },
-        contentAlignment = Alignment.Center,
-    ) {
-        OnlineGlyph(symbol, Modifier.size(21.dp), if (enabled) color else OnlineSecondary.copy(alpha = .3f))
-    }
-}
-
-@Composable
-private fun OnlineText(
+internal fun OnlineText(
     text: String,
     modifier: Modifier = Modifier,
     size: TextUnit = 16.sp,
@@ -519,10 +458,10 @@ private fun OnlineText(
     )
 }
 
-private enum class OnlineSymbol { Search, Clear, More, Chevron }
+internal enum class OnlineSymbol { Search, Clear, Chevron, Check }
 
 @Composable
-private fun OnlineGlyph(symbol: OnlineSymbol, modifier: Modifier, color: Color = Color.White) {
+internal fun OnlineGlyph(symbol: OnlineSymbol, modifier: Modifier, color: Color = Color.White) {
     Canvas(modifier.clearAndSetSemantics {}) {
         val unit = size.minDimension / 24f
         withTransform({
@@ -539,10 +478,14 @@ private fun OnlineGlyph(symbol: OnlineSymbol, modifier: Modifier, color: Color =
                     drawLine(color, Offset(15f, 15f), Offset(21f, 21f), 1.8f, StrokeCap.Round)
                 }
                 OnlineSymbol.Clear -> {
-                    drawLine(color, Offset(7f, 7f), Offset(17f, 17f), 1.8f, StrokeCap.Round)
-                    drawLine(color, Offset(17f, 7f), Offset(7f, 17f), 1.8f, StrokeCap.Round)
+                    drawCircle(color, 9.5f, Offset(12f, 12f))
+                    drawLine(OnlineControlSurface, Offset(9f, 9f), Offset(15f, 15f), 1.7f, StrokeCap.Round)
+                    drawLine(OnlineControlSurface, Offset(15f, 9f), Offset(9f, 15f), 1.7f, StrokeCap.Round)
                 }
-                OnlineSymbol.More -> listOf(5f, 12f, 19f).forEach { x -> drawCircle(color, 1.7f, Offset(x, 12f)) }
+                OnlineSymbol.Check -> drawPath(
+                    Path().apply { moveTo(5f, 12f); lineTo(10f, 17f); lineTo(19f, 7f) },
+                    color, style = Stroke(1.8f, cap = StrokeCap.Round),
+                )
             }
         }
     }
