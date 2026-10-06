@@ -23,6 +23,8 @@
 
 ## 独立资源
 
+- Compose Cupertino Android / Core 0.1.0-alpha04：Copyright (c) 2023–2024 Compose Cupertino project and open source contributors，Apache-2.0，https://github.com/alexzhirkevich/compose-cupertino 。应用使用主题与开关等Android控件，不引入 `cupertino-icons-extended`；完整许可位于 `app/src/main/assets/licenses/cupertino-Apache-2.0.txt`。
+
 - OkHttp 4.12.0 与 Okio 3.9.0：Square, Inc. 及项目贡献者，Apache-2.0；用于隔离全局 Cookie 的封面下载，不传递播放凭据。上游分别为 https://github.com/square/okhttp 和 https://github.com/square/okio，许可见 `app/src/main/assets/licenses/network-Apache-2.0.txt`。
 
 - Inter 与 Noto Sans SC 字体：SIL Open Font License 1.1。完整文本在 `app/src/main/assets/licenses/`。
