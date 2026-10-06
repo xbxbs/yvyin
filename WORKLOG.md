@@ -6,6 +6,10 @@
 
 ## 最新交付：短导航、Cupertino、真实设置与慢歌词上浮
 
+最新增量：下载默认只保存音频；“下载附加文件”默认关闭，开启后才请求封面和 LRC 伴侣文件。下载完成轮询系统任务并触发资料库扫描、返回资料库。Lyrico 返回应用会重新扫描并同步当前播放元数据；歌曲页支持下拉刷新。底栏恢复上一首按钮。
+
+液态材质不再使用自写白色扫光：已移植 Kyant0 AndroidLiquidGlass Backdrop 1.0.0 的 drawBackdrop/lens/vibrancy/highlight/layerBackdrop 管线。关闭开关是 Haze 普通毛玻璃；开启开关才是折射液态玻璃。整包构建通过，仍未真机验证折射效果和下载伴侣文件在各类 SAF 提供方上的行为。
+
 后续补充：听歌统计、排序持久化、Lyrico 元数据入口和液态玻璃开关已接入；统计按真实播放进度累计，排序写入本地偏好。液态玻璃采用当前 Compose/Haze 兼容的动态高光近似，没有强行加入要求更高 Compose 版本的外部 Backdrop 依赖。最终构建另行记录。
 
 后续修正版：搜索框已从列表外的悬浮定位层移回 `LazyColumn` 真实条目；它与资料库标题、分类一起滚动，不再因 `beforeContentPadding` 和独立 offset 叠加而盖住艺人/歌曲行。`assembleRelease --offline` 已再次通过（1m30s）。

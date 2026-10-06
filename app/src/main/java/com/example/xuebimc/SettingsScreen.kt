@@ -106,6 +106,15 @@ fun SettingsScreen(
                             colors = CupertinoSwitchDefaults.colors(checkedTrackColor = LibraryAccent),
                             modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "液态玻璃" })
                     }
+                    PreferenceDivider()
+                    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+                        PreferenceText("下载附加文件", Modifier.weight(1f))
+                        CupertinoSwitch(checked = values.downloadCompanionFiles,
+                            onCheckedChange = preferences::setDownloadCompanionFiles,
+                            colors = CupertinoSwitchDefaults.colors(checkedTrackColor = LibraryAccent),
+                            modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "下载附加文件" })
+                    }
                 }
             }
             folderError?.let { error -> item(key = "settings:error") {

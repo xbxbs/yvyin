@@ -7,6 +7,7 @@ import android.app.job.JobScheduler
 import android.app.job.JobService
 import android.content.BroadcastReceiver
 import android.content.ComponentName
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -16,6 +17,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
+import android.provider.MediaStore
 import org.json.JSONObject
 import java.io.File
 import java.io.IOException
@@ -121,6 +123,32 @@ object MusicDownloads {
     fun pending(context: Context): List<PendingDownload> = synchronized(lock) {
         records(context.applicationContext).filter { it.state != State.COMPLETE }
     }
+
+    fun isDownloadComplete(context: Context, downloadId: Long): Boolean = runCatching {
+        val task = synchronized(lock) { records(context.applicationContext).firstOrNull { it.downloadId == downloadId } }
+        if (task != null) task.state == State.COMPLETE
+        else rows(context.applicationContext, downloadId).firstOrNull()?.status == DownloadManager.STATUS_SUCCESSFUL
+    }.getOrDefault(false)
+
+    fun writeTextCompanion(context: Context, text: String, fileName: String, mime: String): Boolean = runCatching {
+        val app = context.applicationContext
+        val prefs = app.getSharedPreferences(AppPreferences.PREF_NAME, Context.MODE_PRIVATE)
+        val tree = prefs.getString(AppPreferences.KEY_DOWNLOAD_TREE_URI, null)?.takeIf { it.isNotBlank() }
+        val uri: Uri = (if (tree == null && android.os.Build.VERSION.SDK_INT >= 29) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, Environment.DIRECTORY_MUSIC + "/余音")
+            }
+            app.contentResolver.insert(MediaStore.Files.getContentUri("external"), values)
+        } else if (tree != null) {
+            val parent = parentDirectory(app, Uri.parse(tree), CancellationSignal())
+            DocumentsContract.createDocument(app.contentResolver, parent, mime, fileName)
+        } else null) ?: throw IOException("无法创建附加文件")
+        app.contentResolver.openOutputStream(uri)?.use { it.write(text.toByteArray(Charsets.UTF_8)) }
+            ?: throw IOException("无法写入附加文件")
+        true
+    }.getOrDefault(false)
 
     private fun manager(context: Context) = context.getSystemService(DownloadManager::class.java)
     private fun scheduler(context: Context) = context.getSystemService(JobScheduler::class.java)
@@ -398,6 +426,7 @@ internal object MusicDownloadRules {
         "audio/flac" to "flac", "audio/ogg" to "ogg", "audio/opus" to "opus",
         "audio/wav" to "wav", "audio/aiff" to "aiff", "audio/amr" to "amr",
         "audio/3gpp" to "3gp", "audio/webm" to "webm", "video/mp4" to "mp4",
+        "image/jpeg" to "jpg", "image/png" to "png", "image/webp" to "webp",
     )
     private val aliases = mapOf(
         "audio/mp3" to "audio/mpeg", "audio/x-mpeg" to "audio/mpeg", "audio/x-flac" to "audio/flac",

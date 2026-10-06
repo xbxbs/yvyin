@@ -126,6 +126,7 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import kotlinx.coroutines.Dispatchers
@@ -246,7 +247,11 @@ internal fun LibrarySurface(
     // Written only by consumed user drags, never by jump-to-letter, restore or sorting.
     // The flow observes this state; composition never observes individual scroll offsets.
     val userScrollDirection = remember { mutableStateOf<Boolean?>(null) }
+    var pullDistance by remember { mutableStateOf(0f) }
     val directionSlopPx = with(LocalDensity.current) { 8.dp.toPx() }
+    val refreshThresholdPx = with(LocalDensity.current) { 64.dp.toPx() }
+    val refreshMaxPx = with(LocalDensity.current) { 96.dp.toPx() }
+    val refreshView = LocalView.current
     val userScrollConnection = remember(listState, directionSlopPx) {
         object : NestedScrollConnection {
             private var travel = 0f
@@ -259,6 +264,28 @@ internal fun LibrarySurface(
                     travel = 0f
                 }
                 return Offset.Zero
+            }
+        }
+    }
+    val refreshConnection = remember(listState, isActive, refreshThresholdPx, refreshMaxPx, refreshView) {
+        object : NestedScrollConnection {
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset {
+                if (source == NestedScrollSource.UserInput && available.y > 0f &&
+                    listState.firstVisibleItemIndex == 0 && listState.firstVisibleItemScrollOffset == 0 && isActive) {
+                    pullDistance = (pullDistance + available.y * .5f).coerceAtMost(refreshMaxPx)
+                    return Offset(0f, available.y * .5f)
+                }
+                if (available.y < 0f) pullDistance = 0f
+                return Offset.Zero
+            }
+
+            override suspend fun onPreFling(available: Velocity): Velocity {
+                if (pullDistance >= refreshThresholdPx) {
+                    pullDistance = 0f
+                    onRefresh()
+                    refreshView.performHapticFeedback(HapticFeedbackConstants.KEYBOARD_TAP)
+                } else pullDistance = 0f
+                return Velocity.Zero
             }
         }
     }
@@ -421,7 +448,7 @@ internal fun LibrarySurface(
         Box(
             Modifier.fillMaxSize()
                 .windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal))
-                .imePadding().nestedScroll(userScrollConnection)
+                .imePadding().nestedScroll(userScrollConnection).nestedScroll(refreshConnection)
                 .then(if (sheetShowing) Modifier.clearAndSetSemantics {} else Modifier),
         ) {
             LazyColumn(

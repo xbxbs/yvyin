@@ -60,6 +60,8 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import dev.chrisbanes.haze.HazeState
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
 import dev.chrisbanes.haze.hazeSource
 import java.util.Locale
 
@@ -173,7 +175,28 @@ internal fun LocalMusicApp(
         }
         playerVisible = false
     }
-    LaunchedEffect(library) { playback.setAutoplayLibrary(library) }
+    fun lyricoIntent(track: Track): Intent? {
+        if (track.isOnline) return null
+        val intent = Intent(Intent.ACTION_EDIT, track.uri).apply {
+            setPackage("com.lonx.lyrico")
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
+            clipData = android.content.ClipData.newRawUri(track.title, track.uri)
+        }
+        return intent.takeIf { it.resolveActivity(context.packageManager) != null }
+    }
+    LaunchedEffect(library) {
+        playback.setAutoplayLibrary(library)
+        val current = playback.currentTrack ?: return@LaunchedEffect
+        val refreshed = library.firstOrNull { it.stableKey == current.stableKey } ?: return@LaunchedEffect
+        if (refreshed.title != current.title || refreshed.artist != current.artist || refreshed.album != current.album) {
+            playback.updateTrack(current.copy(
+                title = refreshed.title,
+                artist = refreshed.artist,
+                album = refreshed.album,
+                displayName = refreshed.displayName,
+            ))
+        }
+    }
 
     LaunchedEffect(sheet) { sheet?.let { lastSheet = it } }
 
@@ -203,6 +226,7 @@ internal fun LocalMusicApp(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasPermission = canReadAudio(context)
+                scanRevision++
                 MusicDownloads.retryPending(context)
             }
         }
@@ -411,6 +435,7 @@ internal fun LocalMusicApp(
     }
     val sheetCorner = RoundedCornerShape(28.dp)
     val bottomBackdrop = remember { HazeState() }
+    val liquidBackdrop = rememberLayerBackdrop()
     var barHeight by remember { mutableStateOf(0.dp) }
     val recordLibraryBackdrop = !playerCovered
 
@@ -435,7 +460,7 @@ internal fun LocalMusicApp(
             clip = p > 0.001f
         }.background(Color(0xFF0E0D11))) {
         // Page bodies are sources; no ancestor ever captures a header's own blur/scrim.
-        Box(Modifier.fillMaxSize()) {
+        Box(Modifier.fillMaxSize().then(if (appPreferenceValues.liquidGlass) Modifier.layerBackdrop(liquidBackdrop) else Modifier)) {
         // Tabs cross-fade (they are siblings, not a push).
         Box(Modifier.fillMaxSize().graphicsLayer {
             val o = onlineProgress.value.coerceIn(0f, 1f)
@@ -523,8 +548,19 @@ internal fun LocalMusicApp(
                 onDownload = { track ->
                     scope.launch {
                         try {
-                            onlineRepository.download(track)
-                            onlineError = "已加入下载，保存到${appPreferenceValues.downloadFolderName}。"
+                            val id = onlineRepository.download(track)
+                            onlineError = "正在下载…"
+                            scope.launch {
+                                repeat(180) {
+                                    delay(1_000L)
+                                    if (MusicDownloads.isDownloadComplete(context, id)) {
+                                        scanRevision++
+                                        selectTab(MusicTab.Library)
+                                        message = "下载完成，资料库已刷新"
+                                        return@launch
+                                    }
+                                }
+                            }
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (failure: Exception) { onlineError = failure.localizedMessage ?: "下载失败" }
                     }
@@ -570,6 +606,7 @@ internal fun LocalMusicApp(
         }
         if (!libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible && !settingsOverlayVisible) GlassTabBar(
             backdrop = bottomBackdrop,
+            liquidBackdrop = liquidBackdrop.takeIf { appPreferenceValues.liquidGlass },
             track = currentTrack,
             isPlaying = playback.playing,
             selectedTab = selectedTab,
@@ -578,6 +615,7 @@ internal fun LocalMusicApp(
             onExpand = { compactBar = false },
             onOpenPlayer = { if (playback.currentTrack != null) playerVisible = true },
             onTogglePlayback = playback::togglePlayback,
+            onPrevious = playback::previous,
             onNext = playback::next,
             onHeightChange = { barHeight = it },
             modifier = Modifier.align(Alignment.BottomCenter),
@@ -694,6 +732,14 @@ internal fun LocalMusicApp(
                             SheetActionDivider()
                             SheetActionRow(if (playback.favorite) "取消收藏" else "收藏歌曲", PlayerIconType.Star,
                                 filledStar = playback.favorite, onClick = playback::toggleFavorite)
+                            lyricoIntent(track)?.let { editIntent ->
+                                SheetActionDivider()
+                                SheetActionRow("编辑元数据", PlayerIconType.Info) {
+                                    runCatching { context.startActivity(editIntent) }
+                                        .onFailure { message = "无法打开 Lyrico" }
+                                    sheet = null
+                                }
+                            }
                         }
                         if (track.isOnline) {
                             SheetActionDivider()

@@ -62,6 +62,7 @@ import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.chrisbanes.haze.HazeState
+import com.kyant.backdrop.backdrops.LayerBackdrop
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -86,12 +87,14 @@ enum class MusicTab { Library, Online, Settings }
 @Composable
 fun GlassTabBar(
     backdrop: HazeState,
+    liquidBackdrop: LayerBackdrop? = null,
     track: Track?,
     isPlaying: Boolean,
     selectedTab: MusicTab,
     onSelectTab: (MusicTab) -> Unit,
     onOpenPlayer: () -> Unit,
     onTogglePlayback: () -> Unit,
+    onPrevious: () -> Unit,
     onNext: () -> Unit,
     onHeightChange: (Dp) -> Unit,
     modifier: Modifier = Modifier,
@@ -108,7 +111,7 @@ fun GlassTabBar(
     @Composable fun Tabs(modifier: Modifier = Modifier) {
         Row(
             modifier.width(NavigationWidth).height(58.dp)
-                .glassCapsule(backdrop, RoundedCornerShape(TabBarRadius)).padding(TabBarInset),
+                .glassCapsule(backdrop, liquidBackdrop, RoundedCornerShape(TabBarRadius)).padding(TabBarInset),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             GlassTab("资料库", GlassTabIcon.Library, selected = selectedTab == MusicTab.Library,
@@ -131,9 +134,9 @@ fun GlassTabBar(
             Layout(
                 modifier = Modifier.fillMaxWidth().clipToBounds(),
                 content = {
-                    Box(Modifier.glassCapsule(backdrop, RoundedCornerShape(MiniPlayerRadius))) {
+                    Box(Modifier.glassCapsule(backdrop, liquidBackdrop, RoundedCornerShape(MiniPlayerRadius))) {
                         // The same mini-player stays composed throughout the morph.
-                        GlassMiniPlayer(track, isPlaying, onOpenPlayer, onTogglePlayback, onNext)
+                        GlassMiniPlayer(track, isPlaying, onOpenPlayer, onTogglePlayback, onPrevious, onNext)
                     }
                     Tabs(if (compact) Modifier.clearAndSetSemantics {} else Modifier)
                     Box(
@@ -179,12 +182,14 @@ fun GlassTabBar(
 @Composable
 private fun Modifier.glassCapsule(
     backdrop: HazeState,
+    liquidBackdrop: LayerBackdrop?,
     shape: RoundedCornerShape,
 ): Modifier {
     return this
         // Swallow touches on empty glass so they never reach the list underneath.
         .pointerInput(Unit) { detectTapGestures { } }
-        .musicGlassSurface(backdrop, shape)
+        .then(if (liquidBackdrop != null) Modifier.kyantLiquidGlass(liquidBackdrop, shape)
+            else Modifier.musicGlassSurface(backdrop, shape))
 }
 
 @Composable
@@ -193,6 +198,7 @@ private fun GlassMiniPlayer(
     isPlaying: Boolean,
     onOpenPlayer: () -> Unit,
     onTogglePlayback: () -> Unit,
+    onPrevious: () -> Unit,
     onNext: () -> Unit,
 ) {
     Row(Modifier.fillMaxWidth().height(56.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -217,6 +223,7 @@ private fun GlassMiniPlayer(
                 )
             }
         }
+        GlassIconButton(GlassTabIcon.Previous, "上一首", onPrevious)
         GlassIconButton(if (isPlaying) GlassTabIcon.Pause else GlassTabIcon.Play, if (isPlaying) "暂停播放" else "继续播放", onTogglePlayback)
         GlassIconButton(GlassTabIcon.Next, "下一首", onNext)
         Spacer(Modifier.width(6.dp))
@@ -276,7 +283,7 @@ private fun GlassText(
     )
 }
 
-private enum class GlassTabIcon { Library, Online, Settings, Play, Pause, Next }
+private enum class GlassTabIcon { Library, Online, Settings, Play, Pause, Previous, Next }
 
 @Composable
 private fun GlassIcon(icon: GlassTabIcon, modifier: Modifier, color: Color) {
@@ -325,6 +332,11 @@ private fun GlassIcon(icon: GlassTabIcon, modifier: Modifier, color: Color) {
                     drawPath(Path().apply { moveTo(3f, 6f); lineTo(11f, 12f); lineTo(3f, 18f); close() }, color)
                     drawPath(Path().apply { moveTo(11f, 6f); lineTo(19f, 12f); lineTo(11f, 18f); close() }, color)
                     drawRoundRect(color, Offset(19f, 6f), Size(2f, 12f), CornerRadius(1f))
+                }
+                GlassTabIcon.Previous -> {
+                    drawRoundRect(color, Offset(3f, 6f), Size(2f, 12f), CornerRadius(1f))
+                    drawPath(Path().apply { moveTo(12f, 6f); lineTo(4f, 12f); lineTo(12f, 18f); close() }, color)
+                    drawPath(Path().apply { moveTo(20f, 6f); lineTo(12f, 12f); lineTo(20f, 18f); close() }, color)
                 }
             }
         }

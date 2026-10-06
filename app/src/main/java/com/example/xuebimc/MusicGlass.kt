@@ -47,7 +47,6 @@ internal fun Modifier.musicGlassSurface(backdrop: HazeState, shape: Shape): Modi
     }
     val hairline = with(LocalDensity.current) { .5f.toDp() }
     return clip(shape).border(hairline, rim, shape).hazeEffect(backdrop, style)
-        .then(if (LocalLiquidGlass.current) Modifier.liquidGlassSheen() else Modifier)
 }
 
 /** Blur radius fades toward the body; a separate opaque scrim protects header text. */

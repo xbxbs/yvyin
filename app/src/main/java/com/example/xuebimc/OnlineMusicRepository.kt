@@ -742,7 +742,25 @@ class OnlineMusicRepository(context: Context) {
             else -> "mp3"
         }
         coroutineContext.ensureActive()
-        MusicDownloads.enqueue(context, playable, "$safeName.$extension")
+        val audioId = MusicDownloads.enqueue(context, playable, "$safeName.$extension")
+        if (appPreferences.getBoolean(AppPreferences.KEY_DOWNLOAD_COMPANION, false)) {
+            val metadata = resolveMetadata(track)
+            metadata.artworkUri?.let { cover ->
+                if (cover.scheme == "http" || cover.scheme == "https") runCatching {
+                    MusicDownloads.enqueue(context, Track(0L, cover, "$safeName 封面", "", "", 0L, mimeType = "image/jpeg"), "$safeName.jpg")
+                }
+            }
+            if (metadata.performanceLines.isNotEmpty()) {
+                val lrc = metadata.performanceLines.joinToString("\n") { line ->
+                    val minutes = line.startMs / 60_000L
+                    val seconds = (line.startMs % 60_000L) / 1_000L
+                    val millis = line.startMs % 1_000L
+                    "[${minutes}:${seconds.toString().padStart(2, '0')}.${millis.toString().padStart(3, '0')}]${line.text}"
+                }
+                MusicDownloads.writeTextCompanion(context, lrc, "$safeName.lrc", "text/plain")
+            }
+        }
+        audioId
     }
 
     private fun cleanText(text: String): String = Html.fromHtml(text, Html.FROM_HTML_MODE_LEGACY).toString()

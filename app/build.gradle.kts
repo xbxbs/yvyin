@@ -62,5 +62,7 @@ dependencies {
     // JDK bridge only; implementations remain in kotlin-stdlib 2.1.0.
     implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.0")
     implementation("io.github.alexzhirkevich:cupertino-android:0.1.0-alpha04")
+    // Kyant0 AndroidLiquidGlass / Backdrop. Used only when the liquid-glass preference is on.
+    implementation("io.github.kyant0:backdrop:1.0.0")
     debugImplementation("androidx.compose.ui:ui-tooling")
 }
