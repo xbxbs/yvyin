@@ -1,0 +1,18 @@
+{
+  "name": "rushi-amll-benchmark",
+  "private": true,
+  "version": "1.0.0",
+  "description": "Browser-only AMLL reference; not embedded in the Android application",
+  "dependencies": {
+    "@applemusic-like-lyrics/core": "0.6.0",
+    "@pixi/app": "7.4.3",
+    "@pixi/core": "7.4.3",
+    "@pixi/display": "7.4.3",
+    "@pixi/filter-blur": "7.4.3",
+    "@pixi/filter-bulge-pinch": "5.1.1",
+    "@pixi/filter-color-matrix": "7.4.3",
+    "@pixi/sprite": "7.4.3",
+    "esbuild": "0.25.1",
+    "playwright": "1.51.1"
+  }
+}

@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="zh-CN">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AMLL 0.6.0 · 同曲运行基准</title>
+<link rel="stylesheet" href="./bundle.css">
+<style>
+@font-face{font-family:Player;src:url('./player_cjk_medium.ttf')}
+*{box-sizing:border-box}body{margin:0;background:#392c29;color:white;font-family:Player,sans-serif}
+body:before{content:'';position:fixed;inset:0;background:url('./background.jpg') center/cover;z-index:-1}
+header{height:180px;padding:62px 34px 22px;display:flex;gap:16px;align-items:center}
+header img{width:70px;height:70px;border-radius:9px}header b{font-size:17px;font-weight:500;white-space:nowrap}
+header p{font-size:16px;opacity:.5;margin:6px 0}#lyrics{height:calc(100vh - 180px);width:100%}
+.amll-lyric-player{--amll-lp-font-size:31.2px;font-weight:500}
+#stamp{position:fixed;bottom:8px;right:12px;font:10px monospace;opacity:.55;pointer-events:none}
+</style>
+<header><img src="./cover.jpg"><div><b>如诗一般的形容妳</b><p>曹杨</p></div></header>
+<main id="lyrics"></main><aside id="stamp"></aside>
+<script type="module" src="./bundle.js"></script>
+</html>
