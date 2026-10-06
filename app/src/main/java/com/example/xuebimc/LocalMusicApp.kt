@@ -13,6 +13,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.spring
+import androidx.compose.animation.animateContentSize
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -103,6 +104,8 @@ internal fun LocalMusicApp(
     var onlineOverlayVisible by remember { mutableStateOf(false) }
     var playlistOverlayVisible by remember { mutableStateOf(false) }
     var settingsOverlayVisible by remember { mutableStateOf(false) }
+    var libraryOpenRequest by remember { mutableStateOf<LibraryOpenRequest?>(null) }
+    var libraryOpenRevision by rememberSaveable { mutableLongStateOf(0L) }
     var playlistVisible by remember { mutableStateOf(false) }
     var playlistAddVisible by remember { mutableStateOf(false) }
     var playlistAddTracks by remember { mutableStateOf<List<Track>>(emptyList()) }
@@ -114,6 +117,7 @@ internal fun LocalMusicApp(
     var onlineLoading by remember { mutableStateOf(false) }
     var onlineError by remember { mutableStateOf<String?>(null) }
     var onlineRevision by remember { mutableIntStateOf(0) }
+    var relatedSearchRevision by rememberSaveable { mutableIntStateOf(0) }
     var onlineSearchJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
     var lyricsVisible by remember { mutableStateOf(false) }
     var queueVisible by remember { mutableStateOf(false) }
@@ -129,6 +133,44 @@ internal fun LocalMusicApp(
         selectedTab = tab
         compactBar = false
         if (tab != MusicTab.Library) playlistVisible = false
+    }
+    fun performOnlineSearch() {
+        onlineSearchJob?.cancel()
+        val revision = ++onlineRevision
+        val source = onlineSources.firstOrNull { it.id == onlineSourceId && it.enabled }
+        val query = onlineQuery
+        if (source == null) {
+            onlineLoading = false
+            onlineError = "该音源未启用"
+            return
+        }
+        onlineLoading = true
+        onlineError = null
+        onlineSearchJob = scope.launch {
+            try {
+                val result = onlineRepository.search(source.id, query)
+                if (revision == onlineRevision) { onlineResults = result; onlineError = null }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) { if (revision == onlineRevision) onlineError = failure.localizedMessage ?: "在线搜索失败" }
+            finally { if (revision == onlineRevision) onlineLoading = false }
+        }
+    }
+    fun openRelated(track: Track, artist: Boolean) {
+        sheet = null
+        if (track.isOnline) {
+            val query = (if (artist) track.artist else track.album).trim()
+            if (query.isBlank()) { message = "这首歌没有对应的${if (artist) "艺人" else "专辑"}信息。"; return }
+            onlineSourceId = track.sourceId ?: onlineSourceId
+            onlineQuery = query
+            onlineResults = emptyList()
+            relatedSearchRevision++
+            selectTab(MusicTab.Online)
+            performOnlineSearch()
+        } else {
+            libraryOpenRequest = LibraryOpenRequest(++libraryOpenRevision, track, artist)
+            selectTab(MusicTab.Library)
+        }
+        playerVisible = false
     }
     LaunchedEffect(library) { playback.setAutoplayLibrary(library) }
 
@@ -158,7 +200,10 @@ internal fun LocalMusicApp(
     val lifecycle = LocalLifecycleOwner.current.lifecycle
     DisposableEffect(lifecycle, context) {
         val observer = LifecycleEventObserver { _, event ->
-            if (event == Lifecycle.Event.ON_RESUME) hasPermission = canReadAudio(context)
+            if (event == Lifecycle.Event.ON_RESUME) {
+                hasPermission = canReadAudio(context)
+                MusicDownloads.retryPending(context)
+            }
         }
         lifecycle.addObserver(observer)
         onDispose { lifecycle.removeObserver(observer) }
@@ -192,7 +237,7 @@ internal fun LocalMusicApp(
         keyboard?.hide()
         playback.playTrack(track, queue, sourceName)
         view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
-        playerVisible = true
+        if (appPreferenceValues.autoOpenPlayer) playerVisible = true
         selectedTab = MusicTab.Library
         lyricsVisible = false
         queueVisible = false
@@ -215,7 +260,7 @@ internal fun LocalMusicApp(
         playback.playTrack(track, queue.ifEmpty { listOf(track) },
             if (fromSaved) "在线歌单" else "${source.name}搜索")
         view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
-        playerVisible = true
+        if (appPreferenceValues.autoOpenPlayer) playerVisible = true
         lyricsVisible = false
         queueVisible = false
         if (Build.VERSION.SDK_INT >= 33 && !preferences.getBoolean("notification_permission_requested", false) &&
@@ -368,7 +413,7 @@ internal fun LocalMusicApp(
     var barHeight by remember { mutableStateOf(0.dp) }
     val recordLibraryBackdrop = !playerCovered
 
-    CompositionLocalProvider(LocalAnimatedBackground provides appPreferenceValues.animatedBackground) {
+    CompositionLocalProvider(LocalAnimatedBackground provides true) {
     SharedArtworkTransition(
         playerExpansion = playerExpansion,
         enabled = !lyricsVisible && !queueVisible && sheet == null && !playlistAddVisible &&
@@ -393,6 +438,7 @@ internal fun LocalMusicApp(
             alpha = (1f - o) * (1f - settingsProgress.value.coerceIn(0f, 1f))
         }) {
             LibraryScreen(
+                openRequest = libraryOpenRequest,
                 tracks = library,
                 currentTrack = currentTrack,
                 isPlaying = playback.playing,
@@ -441,6 +487,7 @@ internal fun LocalMusicApp(
             .pointerInput(Unit) { detectTapGestures { } }) {
             tabStates.SaveableStateProvider("online") {
             OnlineMusicScreen(
+                externalQueryRevision = relatedSearchRevision,
                 isPlaying = playback.playing && onlineVisible && !playerCovered && !settingsCovered,
                 onScrollDirection = { if (onlineVisible) compactBar = it },
                 isActive = onlineVisible && !playerPresent && !settingsPresent && !playlistPresent && !playlistAddVisible && sheet == null,
@@ -463,32 +510,7 @@ internal fun LocalMusicApp(
                     onlineResults = emptyList()
                     onlineError = null
                 },
-                onSearch = {
-                    onlineSearchJob?.cancel()
-                    onlineRevision++
-                    val revision = onlineRevision
-                    val source = onlineSources.firstOrNull { it.id == onlineSourceId && it.enabled }
-                    if (source == null) {
-                        onlineError = "该音源未启用"
-                    } else {
-                        onlineLoading = true
-                        onlineError = null
-                        onlineSearchJob = scope.launch {
-                            try {
-                                val result = onlineRepository.search(source.id, onlineQuery)
-                                if (revision == onlineRevision) {
-                                    onlineResults = result
-                                    onlineError = null
-                                }
-                            } catch (cancelled: CancellationException) { throw cancelled }
-                            catch (failure: Exception) {
-                                if (revision == onlineRevision) onlineError = failure.localizedMessage ?: "在线搜索失败"
-                            } finally {
-                                if (revision == onlineRevision) onlineLoading = false
-                            }
-                        }
-                    }
-                },
+                onSearch = ::performOnlineSearch,
                 onPlay = { playOnlineTrack(it, listOf(it), false) },
                 onPlayFromList = ::playOnlineTrack,
                 onSave = { onlineSaved = onlineRepository.saveTrack(it) },
@@ -497,7 +519,7 @@ internal fun LocalMusicApp(
                     scope.launch {
                         try {
                             onlineRepository.download(track)
-                            onlineError = "已提交系统下载；完成后可回资料库扫描刷新。"
+                            onlineError = "已加入下载，保存到${appPreferenceValues.downloadFolderName}。"
                         } catch (cancelled: CancellationException) { throw cancelled }
                         catch (failure: Exception) { onlineError = failure.localizedMessage ?: "下载失败" }
                     }
@@ -532,14 +554,11 @@ internal fun LocalMusicApp(
             tabStates.SaveableStateProvider("settings") {
                 SettingsScreen(
                     preferences = appPreferences, sources = onlineSources,
-                    hasAudioPermission = hasPermission, scanning = loading, bottomInset = barHeight,
+                    currentSourceId = onlineSourceId, bottomInset = barHeight,
                     isActive = settingsVisible && !playerPresent,
                     onOverlayVisibilityChange = { settingsOverlayVisible = it },
                     onBack = { selectTab(MusicTab.Library) },
-                    onScan = { if (hasPermission) scanRevision++ else audioPermissionLauncher.launch(audioPermission()) },
-                    onOpenSystemSettings = {
-                        context.startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:${context.packageName}")))
-                    },
+                    onDeveloperOptions = { frameRateMonitor.captureBeforeInfo(lyricsVisible); sheet = "developer" },
                 )
             }
         }
@@ -650,26 +669,29 @@ internal fun LocalMusicApp(
                         SheetTrackHeading(track)
                         SheetActionDivider()
                         SheetActionGroup {
-                            SheetActionRow(if (playback.favorite) "取消收藏" else "收藏歌曲", PlayerIconType.Star,
-                                selected = playback.favorite, onClick = playback::toggleFavorite)
-                            SheetActionDivider()
                             SheetActionRow("下一首播放", PlayerIconType.Next) {
                                 playback.playNext(track)
                                 sheet = null
                             }
                             SheetActionDivider()
-                            SheetActionRow("查看播放队列", PlayerIconType.Queue) {
-                                sheet = null; revealControls(); lyricsVisible = false; queueVisible = true
+                            SheetActionRow("最后播放", PlayerIconType.Queue) {
+                                playback.addToQueue(track)
+                                sheet = null
                             }
-                            SheetActionDivider()
+                        }
+                        SheetActionSectionDivider()
+                        SheetActionGroup {
                             SheetActionRow("加入播放列表", PlayerIconType.AddToPlaylist) {
                                 playlistAddTracks = listOf(track)
                                 sheet = null
                                 playlistAddVisible = true
                             }
+                            SheetActionDivider()
+                            SheetActionRow(if (playback.favorite) "取消收藏" else "收藏歌曲", PlayerIconType.Star,
+                                filledStar = playback.favorite, onClick = playback::toggleFavorite)
                         }
                         if (track.isOnline) {
-                            Spacer(Modifier.height(8.dp))
+                            SheetActionDivider()
                             val saved = onlineSaved.any { it.stableKey == track.stableKey }
                             SheetActionGroup {
                                 SheetActionRow(if (saved) "从在线歌单移除" else "加入在线歌单", PlayerIconType.AddToPlaylist) {
@@ -677,7 +699,17 @@ internal fun LocalMusicApp(
                                 }
                             }
                         }
-                        Spacer(Modifier.height(8.dp))
+                        SheetActionSectionDivider()
+                        SheetActionGroup {
+                            SheetActionRow(if (track.isOnline) "搜索专辑" else "前往专辑", PlayerIconType.Album) { openRelated(track, false) }
+                            SheetActionDivider()
+                            SheetActionRow(if (track.isOnline) "搜索艺人" else "前往艺人", PlayerIconType.Artist) { openRelated(track, true) }
+                            SheetActionDivider()
+                            SheetActionRow("查看播放队列", PlayerIconType.Queue) {
+                                sheet = null; revealControls(); lyricsVisible = false; queueVisible = true
+                            }
+                        }
+                        SheetActionSectionDivider()
                         SheetActionGroup {
                             SheetActionRow("分享歌曲", PlayerIconType.Share) {
                                 val share = Intent(Intent.ACTION_SEND).apply {
@@ -701,58 +733,32 @@ internal fun LocalMusicApp(
                             }
                         }
                     }
-                    "quality" -> currentTrack?.let { track ->
-                        val quality = track.audioQuality
-                        Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-                            MusicText(quality.badgeLabel ?: "音频信息", 17f, true)
-                            SheetActionDivider()
-                            AudioParameterRow("格式", quality.formatLabel)
-                            if (quality.bitsPerSample > 0) AudioParameterRow("位深", "${quality.bitsPerSample}-bit")
-                            if (quality.sampleRate > 0) {
-                                val large = quality.sampleRate >= 1_000_000
-                                val rate = java.math.BigDecimal.valueOf(quality.sampleRate.toLong())
-                                    .divide(java.math.BigDecimal.valueOf(if (large) 1_000_000L else 1_000L))
-                                    .stripTrailingZeros().toPlainString()
-                                AudioParameterRow("采样率", "$rate ${if (large) "MHz" else "kHz"}")
-                            }
-                            if (quality.bitrate > 0) AudioParameterRow("平均码率", "${quality.bitrate / 1000} kbps")
-                            if (quality.level == AudioQualityLevel.HiResLossless) {
-                                MusicText("这里显示文件规格；实际高采样率输出取决于设备和音频链路，可能需要外接 DAC。", 12f)
-                            }
-                        }
-                    }
                     "output" -> {
-                        SheetHeading("音频输出", outputName())
-                        Spacer(Modifier.height(16.dp))
-                        MusicText("使用当前系统音频设备，连接耳机后自动跟随系统输出。")
-                        Spacer(Modifier.height(20.dp))
-                        MusicAction("蓝牙与音频设备") { sheet = null; onBluetoothSettings() }
+                        MusicText("音频输出", 17f, true, modifier = Modifier.padding(16.dp))
+                        SheetActionDivider()
+                        PlayerInformationRow("当前设备", outputName())
+                        SheetActionSectionDivider()
+                        MusicDetailAction("蓝牙与音频设备", PlayerIconType.AirPlay) { sheet = null; onBluetoothSettings() }
+                    }
+                    "developer" -> {
+                        MusicText("开发者选项", 17f, true, modifier = Modifier.padding(16.dp))
+                        SheetActionDivider()
+                        PerformanceReadout(frameRateMonitor)
                     }
                     else -> currentTrack?.let { track ->
-                        SheetTrackHeading(track)
-                        Spacer(Modifier.height(20.dp))
-                        MusicText(track.album.ifBlank { "未知专辑" }, 14f)
-                        Spacer(Modifier.height(8.dp))
-                        val technical = "${track.audioQuality.description} · ${formatPlaybackTime(playback.durationMs)}"
-                        MusicText(technical, 13f)
-                        Spacer(Modifier.height(8.dp))
                         val sourceName = onlineSources.firstOrNull { it.id == track.sourceId }?.name ?: track.sourceId.orEmpty()
-                        val origin = if (track.isOnline) "搜索来源：$sourceName · 第三方解析" else "本地歌曲"
-                        MusicText(if (track.performanceLines.isEmpty()) "$origin · 暂无同步歌词" else "$origin · ${track.performanceLines.size} 行歌词", 13f)
-                        Spacer(Modifier.height(20.dp))
-                        MusicAction("选择歌词文件") { lyricsTarget = track; lyricsPicker.launch(arrayOf("*/*")) }
-                        Spacer(Modifier.height(8.dp))
-                        PerformanceDisclosure(frameRateMonitor)
+                        PlayerTrackInformation(track, playback.durationMs, if (track.isOnline) sourceName else "本地歌曲") {
+                            lyricsTarget = track
+                            sheet = null
+                            lyricsPicker.launch(arrayOf("*/*"))
+                        }
                     }
                 }
         }
-        val contextKind = if (kind == "quality") "quality" else "more"
-        AppContextMenu(visible = sheet == "more" || sheet == "quality", anchor = null, onDismiss = { sheet = null }) {
-            SheetContents(contextKind)
-        }
-        AppSheet(visible = sheet != null && sheet != "more" && sheet != "quality", onDismiss = { sheet = null },
-            title = when (kind) { "output" -> "音频输出"; else -> "歌曲信息" }) {
-            SheetContents(if (kind == "more") "info" else kind)
+        AppContextMenu(visible = sheet != null, anchor = null, onDismiss = { sheet = null }) {
+            Column(Modifier.animateContentSize(spring(dampingRatio = 1f, stiffness = 500f))) {
+                SheetContents(kind)
+            }
         }
         PlaylistAddSheet(playlists, playlistAddTracks, playlistAddVisible) { playlistAddVisible = false }
     }
@@ -791,7 +797,7 @@ internal fun MusicAction(label: String, onClick: () -> Unit) {
 @Composable
 private fun SheetTrackHeading(track: Track) {
     Row(Modifier.fillMaxWidth().then(if (LocalInsideContextMenu.current) Modifier.padding(14.dp) else Modifier), verticalAlignment = Alignment.CenterVertically) {
-        TrackArtwork(track, Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)), 144)
+        TrackArtwork(track, Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)), 128)
         Column(Modifier.weight(1f).padding(start = 12.dp)) {
             MusicText(track.title, 16f, true, maxLines = 2)
             MusicText(track.artist, 13f, maxLines = 1)
@@ -811,10 +817,8 @@ private fun QueueModeControl(label: String, active: Boolean, modifier: Modifier,
 }
 
 @Composable
-private fun PerformanceDisclosure(monitor: FrameRateMonitor) {
-    var expanded by remember { mutableStateOf(false) }
-    MusicAction(if (expanded) "收起性能读数" else "性能读数") { expanded = !expanded }
-    if (expanded) {
+private fun PerformanceReadout(monitor: FrameRateMonitor) {
+    Column(Modifier.padding(16.dp)) {
         val sample = monitor.snapshot
         Spacer(Modifier.height(12.dp))
         MusicText("系统刷新率：${sample.refreshRateHz?.let { String.format(Locale.ROOT, "%.1f Hz", it) } ?: "待采样"}", 13f)

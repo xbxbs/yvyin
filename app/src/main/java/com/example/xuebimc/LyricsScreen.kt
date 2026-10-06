@@ -47,6 +47,9 @@ import androidx.compose.ui.graphics.RenderEffect
 import androidx.compose.ui.graphics.TransformOrigin
 import androidx.compose.ui.graphics.asComposeRenderEffect
 import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.layer.GraphicsLayer
+import androidx.compose.ui.graphics.layer.drawLayer
+import androidx.compose.ui.graphics.layer.CompositingStrategy as LayerCompositingStrategy
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
@@ -68,6 +71,7 @@ import androidx.compose.ui.text.font.FontSynthesis
 import androidx.compose.ui.text.style.LineBreak
 import androidx.compose.ui.text.rememberTextMeasurer
 import androidx.compose.ui.unit.Constraints
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import java.text.BreakIterator
@@ -77,6 +81,7 @@ import kotlin.math.cos
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.ui.graphics.drawscope.withTransform
 import kotlin.math.abs
+import kotlin.math.ceil
 import kotlin.math.roundToInt
 import kotlin.math.sin
 import kotlinx.coroutines.delay
@@ -95,6 +100,12 @@ private class LyricWordPaint(
     val glyphs: List<LyricGlyph>,
     val width: Float,
 )
+
+private class LyricGlyphTexture(val ink: GraphicsLayer, val paint: GraphicsLayer) {
+    var recorded = false
+    var sweepEdge: Float? = null
+    var focus = Float.NaN
+}
 
 private class LyricMeasure(val layout: TextLayoutResult, val words: List<LyricWordPaint>) {
     /** Romanization + translation block under the line; part of the row so it moves with it. */
@@ -194,7 +205,8 @@ fun LyricsViewport(
                 fontWeight = FontWeight.Bold,
                 fontSynthesis = FontSynthesis.None,
                 lineBreak = LineBreak.Heading,
-                // Subpixel glyph positioning, no hinting: a 3px rise must glide, not step pixel by pixel.
+                // Keep horizontal advances unhinted. Vertical lift is a texture transform below;
+                // TextMotion alone does not guarantee subpixel vertical text rasterization.
                 textMotion = TextMotion.Animated,
             )
         }
@@ -503,7 +515,7 @@ private fun AnimatedLyricRow(
         label = "lyricClarity",
     )
     val rowOpacity by animateFloatAsState(
-        if (active) 0.85f else 1f,
+        1f,
         tween(400, easing = filterEasing),
         label = "lyricOpacity",
     )
@@ -518,7 +530,12 @@ private fun AnimatedLyricRow(
         tween(400, easing = filterEasing),
         label = "lyricBlur",
     )
-    Canvas(
+    // Only the focused/fading row owns glyph textures. Reading this threshold in the cache
+    // builder releases them after the fade without rebuilding the cache on every focus tick.
+    val needsGlyphTextures = remember(line, measured) {
+        derivedStateOf { line.wordTimed && measured.words.isNotEmpty() && focus >= 0.002f }
+    }
+    Box(
         modifier.requiredHeight(with(density) { (measured.height + paintPadding * 2f).toDp() })
             .graphicsLayer {
                 val actualY = motion.y
@@ -530,11 +547,35 @@ private fun AnimatedLyricRow(
                 scaleY = motion.scale
                 alpha = rowOpacity
                 renderEffect = blurEffects[(rowBlur / 0.1f).roundToInt().coerceIn(0, blurEffects.lastIndex)]
-            },
-    ) {
+            }.drawWithCache {
+        val fontPixels = measured.layout.layoutInput.style.fontSize.toPx()
+        // The ink is recorded ONCE at a fixed baseline, including the existing overflow room.
+        // Repeated characters share an immutable display list; each occurrence has its own
+        // offscreen paint layer so the moving sweep cannot tint another occurrence.
+        val textureInset = ceil(paintPadding)
+        val inkLayers = mutableMapOf<TextLayoutResult, GraphicsLayer>()
+        val textures = if (needsGlyphTextures.value) measured.words.flatMap { it.glyphs }.associateWith { glyph ->
+            val ink = inkLayers.getOrPut(glyph.layout) {
+                obtainGraphicsLayer().apply {
+                    record(size = IntSize(
+                        glyph.layout.size.width + textureInset.toInt() * 2,
+                        glyph.layout.size.height + textureInset.toInt() * 2,
+                    )) {
+                        drawText(glyph.layout, color = Color.White,
+                            topLeft = Offset(textureInset, textureInset))
+                    }
+                }
+            }
+            LyricGlyphTexture(ink, obtainGraphicsLayer().apply {
+                // Auto may replay text at the translated baseline; Offscreen moves pixels,
+                // not text outlines, preserving fractional Y even on a multi-second note.
+                compositingStrategy = LayerCompositingStrategy.Offscreen
+            })
+        } else emptyMap()
+        onDrawBehind {
         val focused = focus.coerceIn(0f, 1f)
-        val dimAlpha = 0.2f + 0.2f * focused
-        val brightAlpha = 0.2f + 0.8f * focused
+        val dimAlpha = 0.3f + 0.1f * focused
+        val brightAlpha = 0.3f + 0.7f * focused
         measured.sub?.let { sub ->
             drawText(sub, color = Color.White.copy(alpha = 0.26f + 0.34f * focused),
                 topLeft = Offset(paintPadding, paintPadding + measured.layout.size.height + measured.subGap))
@@ -544,15 +585,14 @@ private fun AnimatedLyricRow(
             // syllable sweep for imported songs without those timestamps.
             drawText(measured.layout, color = Color.White.copy(alpha = brightAlpha),
                 topLeft = Offset(paintPadding, paintPadding))
-            return@Canvas
+            return@onDrawBehind
         }
-        if (focused < 0.002f || measured.words.isEmpty()) {
+        if (textures.isEmpty()) {
             drawText(measured.layout, color = Color.White.copy(alpha = dimAlpha),
                 topLeft = Offset(paintPadding, paintPadding))
-            return@Canvas
+            return@onDrawBehind
         }
         val positionMs = position.value
-        val fontPixels = measured.layout.layoutInput.style.fontSize.toPx()
         measured.words.forEach { word ->
             val progress = wordProgress(word, positionMs)
             val floatProgress = ((positionMs - word.startMs).toFloat() /
@@ -561,28 +601,37 @@ private fun AnimatedLyricRow(
             val feather = fontPixels * 0.5f
             val sweep = (word.width + feather) * progress - feather * 0.5f
             word.glyphs.forEach { glyph ->
-                val bounds = glyph.bounds
-                val edge = bounds.left + paintPadding + sweep - glyph.advance
-                // Long notes keep exactly the same glyph size as short notes.
-                val origin = glyph.origin + Offset(paintPadding, paintPadding - lift)
-                if (progress <= 0f || progress >= 1f) {
-                    drawText(glyph.layout, color = Color.White.copy(
-                        alpha = if (progress >= 1f) brightAlpha else dimAlpha,
-                    ), topLeft = origin)
-                } else {
-                    drawText(
-                        glyph.layout,
-                        brush = Brush.horizontalGradient(
-                            listOf(Color.White.copy(alpha = brightAlpha), Color.White.copy(alpha = dimAlpha)),
-                            edge - origin.x - feather * 0.5f,
-                            edge - origin.x + feather * 0.5f,
-                        ),
-                        topLeft = origin,
-                    )
+                val texture = textures.getValue(glyph)
+                val edge = if (progress > 0f && progress < 1f) {
+                    glyph.bounds.left - glyph.origin.x + textureInset + sweep - glyph.advance
+                } else null
+                if (!texture.recorded || texture.sweepEdge != edge ||
+                    (edge != null && texture.focus != focused)) {
+                    texture.paint.record(size = texture.ink.size) {
+                        drawLayer(texture.ink)
+                        if (edge != null) drawRect(
+                            brush = Brush.horizontalGradient(
+                                listOf(Color.White.copy(alpha = brightAlpha), Color.White.copy(alpha = dimAlpha)),
+                                edge - feather * 0.5f,
+                                edge + feather * 0.5f,
+                            ),
+                            blendMode = BlendMode.DstIn,
+                        )
+                    }
+                    texture.recorded = true
+                    texture.sweepEdge = edge
+                    texture.focus = focused
                 }
+                texture.paint.alpha = if (edge != null) 1f else if (progress >= 1f) brightAlpha else dimAlpha
+                // Preserve layout/baseline/TTML end alignment. Never round this translation or
+                // pass lift to drawText: the old path rerasterized each tiny vertical change.
+                texture.paint.translationX = glyph.origin.x + paintPadding - textureInset
+                texture.paint.translationY = glyph.origin.y + paintPadding - textureInset - lift
+                drawLayer(texture.paint)
             }
         }
-    }
+        }
+    })
     // Blur padding is visual overflow, not a larger tap target. Keeping the
     // hitbox at the text bounds prevents adjacent rows stealing each other's taps.
     Box(

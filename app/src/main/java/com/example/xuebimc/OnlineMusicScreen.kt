@@ -1,6 +1,7 @@
 package com.example.xuebimc
 
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.mutableIntStateOf
 
 import android.content.Intent
 import android.widget.Toast
@@ -92,6 +93,7 @@ fun OnlineMusicScreen(
     isActive: Boolean = true,
     isPlaying: Boolean = false,
     onScrollDirection: (Boolean) -> Unit = {},
+    externalQueryRevision: Int = 0,
 ) {
     var showSaved by rememberSaveable { mutableStateOf(false) }
     val resultsState = rememberLazyListState()
@@ -107,6 +109,17 @@ fun OnlineMusicScreen(
     var submittedSource by rememberSaveable { mutableStateOf(selectedSourceId) }
     var searchPending by remember { mutableStateOf(false) }
     var searchFailed by remember { mutableStateOf(false) }
+    var handledExternalQuery by rememberSaveable { mutableIntStateOf(0) }
+    LaunchedEffect(externalQueryRevision) {
+        if (externalQueryRevision != 0 && externalQueryRevision != handledExternalQuery) {
+            handledExternalQuery = externalQueryRevision
+            submittedQuery = query.trim()
+            submittedSource = selectedSourceId
+            searchPending = false
+            searchFailed = false
+            showSaved = false
+        }
+    }
     val resultMatchesInput = submittedQuery == query.trim() && submittedSource == selectedSourceId
     val receipt by OnlineMusicRepository.searchReceipt.collectAsState()
     val sourceResults = remember(results, selectedSourceId) { results.filter { it.isOnline && it.sourceId == selectedSourceId } }

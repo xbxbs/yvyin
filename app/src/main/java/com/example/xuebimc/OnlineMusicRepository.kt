@@ -42,6 +42,8 @@ data class OnlineSource(
     val supportsPlayback: Boolean = false,
     val supportsDownload: Boolean = false,
     val description: String = "",
+    /** Resolver capabilities only; an individual track still needs the source's permission. */
+    val supportedQualities: List<OnlinePlaybackQuality> = emptyList(),
 )
 
 /** Resolver assertions, not independent proof of the audio or a replacement for search metadata. */
@@ -51,24 +53,63 @@ internal data class OnlinePlaybackEvidence(
     val title: String?,
     val artist: String?,
     val audioHost: String,
+    val requestedLevel: String? = null,
+    val reportedLevel: String? = null,
 )
 
 internal data class OnlineSearchReceipt(val sourceId: String, val query: String, val tracks: List<Track>)
+
+/** Do not relabel provider-specific "master", "atmos", etc. as Hi-Res. */
+internal fun publishedOnlineQualities(levels: JSONArray?): List<OnlinePlaybackQuality> {
+    val declared = levels?.let { array ->
+        (0 until array.length().coerceAtMost(50)).mapNotNull { OnlinePlaybackQuality.fromLevel(array.opt(it) as? String) }.toSet()
+    }.orEmpty()
+    return OnlinePlaybackQuality.entries.filter { it in declared }
+}
+
+internal fun requireOnlineQuality(source: OnlineSource, quality: OnlinePlaybackQuality) {
+    if (!source.enabled || !source.supportsPlayback) {
+        throw IOException("${source.name} · ${quality.label}音质：此来源的播放适配未启用")
+    }
+    if (quality !in source.supportedQualities) {
+        throw IOException("${source.name}不支持${quality.label}音质，请切换音质或音源；未自动降低音质")
+    }
+}
+
+internal fun onlineResolvePayload(source: String, id: String, quality: OnlinePlaybackQuality): String =
+    JSONObject().put("source", source).put("rid", id).put("level", quality.level).toString()
+
+/** A resolver assertion is recorded as evidence, never copied into the measured audio badge. */
+internal fun checkedReportedOnlineLevel(data: JSONObject, requested: OnlinePlaybackQuality): String? {
+    val reported = listOf("level", "quality", "qualityLevel", "actualLevel").mapNotNull { key ->
+        OnlinePlaybackQuality.fromLevel(data.opt(key) as? String)
+    }
+    val conflict = reported.firstOrNull { it != requested }
+    if (conflict != null) throw IOException("请求${requested.label}音质，但来源返回${conflict.label}；已停止解析，未自动降低音质")
+    return reported.firstOrNull()?.level
+}
 
 /** The remote JSON selects KNOWN adapters. It is never executable source code. */
 class OnlineMusicRepository(context: Context) {
     private val context = context.applicationContext
     private val preferences = this.context.getSharedPreferences("online_library", Context.MODE_PRIVATE)
+    // Read this file for EACH resolution. The activity, download path and UI own different
+    // repository instances; an instance-captured quality or a cached URL would go stale.
+    private val appPreferences = this.context.getSharedPreferences(AppPreferences.PREF_NAME, Context.MODE_PRIVATE)
     private val activeSearch = AtomicReference<Job?>()
     val builtInSources: List<OnlineSource> = listOf(
         OnlineSource("kw", "酷我", supportsPlayback = true, supportsDownload = true,
-            description = "标准音质 · 以来源实际权限为准"),
+            description = "标准 / 高品质 / 无损 · 以来源实际权限为准",
+            supportedQualities = listOf(OnlinePlaybackQuality.Standard, OnlinePlaybackQuality.High, OnlinePlaybackQuality.Lossless)),
         OnlineSource("kg", "酷狗", supportsPlayback = true, supportsDownload = true,
-            description = "标准音质 · 以来源实际权限为准"),
+            description = "标准 / 高品质 / 无损 / Hi-Res · 以来源实际权限为准",
+            supportedQualities = OnlinePlaybackQuality.entries.toList()),
         OnlineSource("wy", "网易云", supportsPlayback = true, supportsDownload = true,
-            description = "标准音质 · 以来源实际权限为准"),
+            description = "标准 / 高品质 / 无损 / Hi-Res · 以来源实际权限为准",
+            supportedQualities = OnlinePlaybackQuality.entries.toList()),
         OnlineSource("tx", "QQ 音乐", supportsPlayback = true, supportsDownload = true,
-            description = "标准音质 · 以来源实际权限为准"),
+            description = "标准 / 高品质 / 无损 · 以来源实际权限为准",
+            supportedQualities = listOf(OnlinePlaybackQuality.Standard, OnlinePlaybackQuality.High, OnlinePlaybackQuality.Lossless)),
         OnlineSource("bili", "哔哩哔哩", description = "仅搜索 · 公开接口可能受访问限制，未验证播放"),
         OnlineSource("mg", "咪咕", enabled = false, description = "需来源签名认证 · 未接入私有凭据"),
     )
@@ -81,19 +122,39 @@ class OnlineMusicRepository(context: Context) {
             }
         } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
         catch (_: Exception) { preferences.getString("source_config", null) }
-        if (text == null) return@withContext builtInSources
-        val entries = runCatching { JSONObject(text).getJSONArray("lines") }.getOrNull() ?: return@withContext builtInSources
-        builtInSources.map { source ->
+        sourcesFromConfig(text)
+    }
+
+    private fun sourcesFromConfig(text: String?): List<OnlineSource> {
+        if (text == null) return builtInSources
+        val entries = runCatching { JSONObject(text).getJSONArray("lines") }.getOrNull() ?: return builtInSources
+        return builtInSources.map { source ->
             val entry = (0 until entries.length().coerceAtMost(50)).mapNotNull { entries.optJSONObject(it) }
                 .firstOrNull { it.optString("id") == source.id }
-            if (entry == null) source.copy(enabled = false) else source.copy(
+            if (entry == null) source.copy(enabled = false, supportedQualities = emptyList()) else {
+                val playable = source.supportsPlayback && entry.optString("detailApi") == DETAIL_ADAPTERS[source.id]
+                val enabled = source.enabled && entry.optBoolean("enabled", true) && entry.optString("searchApi") == SEARCH_ADAPTERS[source.id]
+                val qualities = if (enabled && playable) publishedOnlineQualities(entry.optJSONArray("levels")) else emptyList()
+                source.copy(
                 // A remote label never implies a new executable adapter or playback permission.
-                enabled = source.enabled && entry.optBoolean("enabled", true) && entry.optString("searchApi") == SEARCH_ADAPTERS[source.id],
-                supportsPlayback = source.supportsPlayback && entry.optString("detailApi") == DETAIL_ADAPTERS[source.id],
+                enabled = enabled,
+                supportsPlayback = playable,
                 supportsDownload = source.supportsDownload && entry.optString("detailApi") == DETAIL_ADAPTERS[source.id],
+                supportedQualities = qualities,
+                description = if (enabled && playable) {
+                    if (qualities.isEmpty()) "来源未公布可用音质" else
+                        qualities.joinToString(" / ") { it.label } + " · 以来源实际权限为准"
+                } else source.description,
             )
+            }
         }
     }
+
+    /** Same capability check used by playback/download; loadSources refreshes its config. */
+    fun supportedPlaybackQualities(sourceId: String): List<OnlinePlaybackQuality> =
+        sourcesFromConfig(preferences.getString("source_config", null))
+            .firstOrNull { it.id == sourceId.trim().lowercase(Locale.ROOT) && it.enabled && it.supportsPlayback }
+            ?.supportedQualities.orEmpty()
 
     suspend fun search(sourceId: String, query: String): List<Track> = withContext(Dispatchers.IO) {
         // Own only this request's child job, never the caller's UI scope.
@@ -403,13 +464,17 @@ class OnlineMusicRepository(context: Context) {
 
     suspend fun resolvePlayableTrack(track: Track): Track = withContext(Dispatchers.IO) {
         if (!track.isOnline) return@withContext track
+        val quality = OnlinePlaybackQuality.fromLevel(appPreferences.getString(AppPreferences.KEY_ONLINE_QUALITY, "standard"))
+            ?: throw IOException("在线播放音质设置无效，请重新选择；未自动降低音质")
         val source = track.sourceId?.trim()?.lowercase(Locale.ROOT)
         val id = track.sourceTrackId?.trim().orEmpty()
-        require(builtInSources.any { it.id == source && it.supportsPlayback } && validId(source.orEmpty(), id)) {
-            "此来源的播放适配尚未启用"
-        }
         synchronized(playbackEvidenceCache) { playbackEvidenceCache.remove(track.stableKey) }
-        val payload = JSONObject().put("source", source).put("rid", id).put("level", "standard").toString()
+        val sourceInfo = sourcesFromConfig(preferences.getString("source_config", null)).firstOrNull { it.id == source }
+            ?: throw IOException("${quality.label}音质：此来源的播放适配尚未启用")
+        requireOnlineQuality(sourceInfo, quality)
+        fun failure(message: String) = IOException("${sourceInfo.name} · ${quality.label}音质：$message")
+        if (!validId(source.orEmpty(), id)) throw failure("曲目标识无效")
+        val payload = onlineResolvePayload(sourceInfo.id, id, quality)
         var lastFailure: Exception? = null
         for (gateway in GATEWAYS) {
             coroutineContext.ensureActive()
@@ -418,7 +483,7 @@ class OnlineMusicRepository(context: Context) {
             } catch (cancelled: kotlinx.coroutines.CancellationException) { throw cancelled }
             catch (failure: SourceHttpException) {
                 // Don't route around authentication, access denial or throttling.
-                if (failure.status in ACCESS_DENIED) throw failure
+                if (failure.status in ACCESS_DENIED) throw SourceHttpException(failure.status, quality)
                 lastFailure = failure
                 continue
             } catch (failure: Exception) {
@@ -428,17 +493,20 @@ class OnlineMusicRepository(context: Context) {
             val code = response.opt("code")
             if (!(code == "0" || (code is Number && code.toDouble() == 0.0))) {
                 // Never surface signed URLs, provider diagnostics or private headers in UI errors.
-                throw IOException("来源未提供标准音质播放权限或地址，请稍后重试")
+                throw failure("来源未提供所选音质的播放权限或地址，请检查来源权限或稍后重试")
             }
-            val data = response.optJSONObject("data") ?: throw IOException("音源缺少播放数据")
+            val data = response.optJSONObject("data") ?: throw failure("音源缺少播放数据")
             // Outside the gateway connection-fallback catch: an identity conflict must never trigger another provider.
-            val evidence = checkPlaybackIdentity(response, data, source.orEmpty(), id)
+            val evidence = try { checkPlaybackIdentity(response, data, source.orEmpty(), id) }
+                catch (invalid: IOException) { throw failure(invalid.message ?: "音频身份核对失败") }
+            val reportedLevel = checkedReportedOnlineLevel(data, quality)
             val rawUrl = data.optString("url").trim()
-            if (rawUrl.isBlank()) throw IOException("音源未提供播放地址")
+            if (rawUrl.isBlank()) throw failure("音源未提供播放地址")
             // Some legacy CDNs advertise HTTP; use their HTTPS equivalent. No
             // cleartext exception or globally disabled TLS checking is added.
             val uri = Uri.parse(rawUrl).let { if (it.scheme == "http") it.buildUpon().scheme("https").build() else it }
-            OnlineHttp.validateUrl(uri.toString())
+            try { OnlineHttp.validateUrl(uri.toString()) }
+            catch (_: Exception) { throw failure("音源返回无效播放地址") }
             val rawHeaders = data.optJSONObject("playbackHeaders") ?: data.optJSONObject("headers")
             val allowed = setOf("user-agent", "referer", "origin", "accept", "range")
             val headers = mutableMapOf<String, String>()
@@ -447,23 +515,31 @@ class OnlineMusicRepository(context: Context) {
                 if (key.lowercase(Locale.ROOT) in allowed && value.length <= 4096 && '\r' !in value && '\n' !in value) headers[key] = value
             }
             val extension = uri.lastPathSegment.orEmpty().substringAfterLast('.').lowercase(Locale.ROOT)
+            if (quality in listOf(OnlinePlaybackQuality.Lossless, OnlinePlaybackQuality.HiRes) &&
+                extension in setOf("mp3", "aac", "opus")) {
+                throw failure("来源返回有损格式，与所选音质不符，已停止解析")
+            }
             val mime = when (extension) {
                 "flac" -> "audio/flac"
                 "m4a", "mp4" -> "audio/mp4"
                 "aac" -> "audio/aac"
                 "ogg", "opus" -> "audio/ogg"
                 "mp3" -> "audio/mpeg"
-                else -> track.mimeType
+                else -> null
             }
             coroutineContext.ensureActive()
             synchronized(playbackEvidenceCache) {
-                playbackEvidenceCache[track.stableKey] = evidence.copy(audioHost = uri.host.orEmpty())
+                playbackEvidenceCache[track.stableKey] = evidence.copy(audioHost = uri.host.orEmpty(),
+                    requestedLevel = quality.level, reportedLevel = reportedLevel)
             }
             // Lyrics/artwork are enriched independently by the screen, never on the path
             // that starts the decoder. A slow metadata host must not postpone playback.
-            return@withContext track.copy(uri = uri, requestHeaders = headers, mimeType = mime)
+            // Re-resolving an old queue entry at another level must not inherit its previous
+            // measured codec/Hi-Res badge. Only a probe of this new stream can populate these.
+            return@withContext track.copy(uri = uri, requestHeaders = headers, mimeType = mime,
+                codecMimeType = null, sampleRate = 0, bits = 0, bitrate = 0L, sizeBytes = 0L)
         }
-        throw IOException(if (lastFailure is SourceHttpException) "解析服务暂不可用（HTTP ${(lastFailure as SourceHttpException).status}）"
+        throw failure(if (lastFailure is SourceHttpException) "解析服务暂不可用（HTTP ${(lastFailure as SourceHttpException).status}）"
             else "解析服务连接失败，请稍后重试")
     }
 
@@ -665,15 +741,8 @@ class OnlineMusicRepository(context: Context) {
             "audio/ogg" -> "ogg"
             else -> "mp3"
         }
-        val request = DownloadManager.Request(playable.uri).setTitle(track.title).setDescription("余音 · 在线下载")
-            .setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-            .setDestinationInExternalPublicDir(Environment.DIRECTORY_MUSIC, "余音/$safeName-${System.currentTimeMillis()}.$extension")
-        playable.mimeType?.let(request::setMimeType)
-        playable.requestHeaders.forEach { (key, value) -> request.addRequestHeader(key, value) }
-        @Suppress("DEPRECATION")
-        request.allowScanningByMediaScanner()
         coroutineContext.ensureActive()
-        (context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager).enqueue(request)
+        MusicDownloads.enqueue(context, playable, "$safeName.$extension")
     }
 
     private fun cleanText(text: String): String = Html.fromHtml(text, Html.FROM_HTML_MODE_LEGACY).toString()
@@ -712,9 +781,10 @@ class OnlineMusicRepository(context: Context) {
     }
 }
 
-internal class SourceHttpException(val status: Int) : IOException(
-    if (status in setOf(401, 403, 412, 418, 429)) "来源限制访问（HTTP $status），未尝试绕过，请稍后重试"
-    else "音源返回 HTTP $status",
+internal class SourceHttpException(val status: Int, quality: OnlinePlaybackQuality? = null) : IOException(
+    (quality?.let { "${it.label}音质：" } ?: "") +
+        if (status in setOf(401, 403, 412, 418, 429)) "来源限制访问（HTTP $status），未尝试绕过，请稍后重试"
+        else "音源返回 HTTP $status",
 )
 
 internal object OnlineHttp {

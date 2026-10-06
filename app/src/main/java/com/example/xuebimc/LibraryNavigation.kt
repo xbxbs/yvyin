@@ -15,6 +15,9 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import dev.chrisbanes.haze.HazeState
 
+/** A local-library destination; use a new id for each navigation action. */
+public data class LibraryOpenRequest(val id: Long, val track: Track, val artist: Boolean)
+
 /** Library landing and all-songs are distinct, state-preserving pages, not one endless feed. */
 @Composable
 fun LibraryScreen(
@@ -33,11 +36,20 @@ fun LibraryScreen(
     backdrop: HazeState? = null,
     backdropVisible: Boolean = true,
     onScrollDirection: (Boolean) -> Unit = {},
+    openRequest: LibraryOpenRequest? = null,
 ) {
     var songsVisible by rememberSaveable { mutableStateOf(false) }
+    var lastOpenRequestId by rememberSaveable { mutableStateOf<Long?>(null) }
     val progress = remember { Animatable(if (songsVisible) 1f else 0f) }
     val songsPresent by remember { derivedStateOf { songsVisible || progress.value > .001f } }
     val songsCovered by remember { derivedStateOf { progress.value >= .999f } }
+    LaunchedEffect(openRequest?.id) {
+        val request = openRequest ?: return@LaunchedEffect
+        if (lastOpenRequestId != request.id) {
+            lastOpenRequestId = request.id
+            songsVisible = false
+        }
+    }
     LaunchedEffect(songsVisible) {
         progress.animateTo(if (songsVisible) 1f else 0f, spring(dampingRatio = 1f, stiffness = 420f))
     }
@@ -55,6 +67,7 @@ fun LibraryScreen(
             backdrop = backdrop,
             backdropVisible = backdropVisible && (songs || !songsCovered),
             onScrollDirection = onScrollDirection,
+            openRequest = if (songs) null else openRequest,
         )
     }
     Box(Modifier.fillMaxSize()) {

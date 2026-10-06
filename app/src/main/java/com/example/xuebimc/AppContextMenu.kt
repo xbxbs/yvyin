@@ -1,12 +1,14 @@
 package com.example.xuebimc
 
-import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
@@ -14,23 +16,20 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.runtime.*
-import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
-import androidx.compose.ui.draw.drawBehind
-import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
-import androidx.compose.ui.graphics.BlurEffect
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.TileMode
 import androidx.compose.ui.graphics.TransformOrigin
-import androidx.compose.ui.graphics.drawscope.scale
-import androidx.compose.ui.graphics.drawscope.translate
 import androidx.compose.ui.graphics.graphicsLayer
-import androidx.compose.ui.graphics.layer.drawLayer
-import androidx.compose.ui.graphics.rememberGraphicsLayer
+import androidx.compose.ui.input.nestedscroll.NestedScrollConnection
+import androidx.compose.ui.input.nestedscroll.NestedScrollSource
+import androidx.compose.ui.input.nestedscroll.nestedScroll
+import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.pointer.util.VelocityTracker
+import androidx.compose.ui.input.pointer.util.addPointerInputChange
 import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.boundsInRoot
 import androidx.compose.ui.layout.onGloballyPositioned
@@ -39,9 +38,15 @@ import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.clearAndSetSemantics
-import androidx.compose.ui.unit.IntSize
+import androidx.compose.ui.unit.Velocity
 import androidx.compose.ui.unit.dp
-import kotlin.math.ceil
+import dev.chrisbanes.haze.HazeState
+import dev.chrisbanes.haze.HazeStyle
+import dev.chrisbanes.haze.HazeTint
+import dev.chrisbanes.haze.hazeEffect
+import dev.chrisbanes.haze.hazeSource
+import kotlinx.coroutines.CoroutineStart
+import kotlinx.coroutines.launch
 
 private data class MenuRequest(
     val owner: Any,
@@ -53,7 +58,7 @@ private data class MenuRequest(
 )
 
 internal class ContextMenuController {
-    internal var lastAnchor: Rect? = null
+    internal var pendingAnchor: Rect? = null
     private var requestState by mutableStateOf<MenuRequest?>(null)
     private var visibleState by mutableStateOf(false)
     var isShowing by mutableStateOf(false)
@@ -77,8 +82,12 @@ internal class ContextMenuController {
         val currentHeader = rememberUpdatedState(header)
         val currentContent = rememberUpdatedState(content)
         DisposableEffect(visible, anchor) {
-            if (visible) present(MenuRequest(owner, anchor ?: lastAnchor, dismiss, showing, currentHeader, currentContent))
-            else hide(owner)
+            if (visible) {
+                // Consume a button's sample once. A submenu keeps the currently presented origin.
+                val origin = anchor ?: pendingAnchor ?: requestState?.takeIf { isShowing || visibleState }?.anchor
+                pendingAnchor = null
+                present(MenuRequest(owner, origin, dismiss, showing, currentHeader, currentContent))
+            } else hide(owner)
             onDispose { hide(owner) }
         }
     }
@@ -87,10 +96,14 @@ internal class ContextMenuController {
     internal fun Render(content: @Composable () -> Unit) {
         val density = LocalDensity.current
         val progress = remember { Animatable(0f) }
+        val progressVelocity = remember { floatArrayOf(0f) }
         val present by remember { derivedStateOf { visibleState || progress.value > .001f } }
         LaunchedEffect(visibleState) {
             progress.animateTo(if (visibleState) 1f else 0f,
-                spring(dampingRatio = 1f, stiffness = if (visibleState) 550f else 700f))
+                spring(dampingRatio = 1f, stiffness = if (visibleState) 550f else 700f),
+                initialVelocity = progressVelocity[0],
+            ) { progressVelocity[0] = velocity }
+            progressVelocity[0] = 0f
         }
         val request = requestState
         SideEffect {
@@ -98,32 +111,26 @@ internal class ContextMenuController {
             request?.showing?.value?.invoke(present)
         }
         BackHandler(present) { request?.dismiss?.value?.invoke() }
-        val scene = rememberGraphicsLayer()
-        val material = rememberGraphicsLayer()
-        val sceneCoords = remember { arrayOfNulls<LayoutCoordinates>(1) }
-        val menuCoords = remember { arrayOfNulls<LayoutCoordinates>(1) }
-        val blurRadius = with(density) { 26.dp.toPx() }
-        val materialBlur = remember(blurRadius) { BlurEffect(blurRadius * .5f, blurRadius * .5f, TileMode.Clamp) }
-        val depthBlur = remember(density) { with(density) { BlurEffect(3.dp.toPx(), 3.dp.toPx(), TileMode.Clamp) } }
-        if (Build.VERSION.SDK_INT >= 31) material.renderEffect = materialBlur
+        val backdrop = remember { HazeState() }
+        val material = remember {
+            HazeStyle(
+                backgroundColor = Color(0xFF28272C),
+                tints = listOf(HazeTint(Color(0xFF28272C).copy(alpha = .72f))),
+                blurRadius = 26.dp,
+                noiseFactor = 0f,
+                fallbackTint = HazeTint(Color(0xFF28272C).copy(alpha = .98f)),
+            )
+        }
         BoxWithConstraints(Modifier.fillMaxSize()) {
             val widthPx = constraints.maxWidth.toFloat()
             val heightPx = constraints.maxHeight.toFloat()
             val margin = with(density) { 12.dp.toPx() }
             val safeTop = WindowInsets.safeDrawing.getTop(density).toFloat() + margin
             val safeBottom = heightPx - WindowInsets.safeDrawing.getBottom(density) - margin
-            Box(Modifier.fillMaxSize().then(if (present) Modifier.clearAndSetSemantics {} else Modifier).graphicsLayer {
-                renderEffect = if (present && Build.VERSION.SDK_INT >= 31) depthBlur else null
-            }.onGloballyPositioned { sceneCoords[0] = it }.drawWithContent {
-                // Most frames have no menu. Do not record/replay the entire animated player
-                // just to keep an unused popup backdrop alive (especially at 120 Hz).
-                if (present) {
-                    scene.record { this@drawWithContent.drawContent() }
-                    drawLayer(scene)
-                } else {
-                    drawContent()
-                }
-            }) { content() }
+            // The page stays sharp. Record it only while a popup needs its local glass material.
+            Box(Modifier.fillMaxSize().then(if (present) {
+                Modifier.clearAndSetSemantics {}.hazeSource(backdrop)
+            } else Modifier)) { content() }
             if (present && request != null) {
                 Box(Modifier.fillMaxSize().graphicsLayer { alpha = progress.value }
                     .background(Color.Black.copy(alpha = .14f)).clickable(
@@ -133,51 +140,102 @@ internal class ContextMenuController {
                 val targetWidth = (maxWidth * .68f).coerceIn(240.dp, 360.dp).coerceAtMost(maxWidth - 24.dp)
                 val menuWidth = with(density) { targetWidth.toPx() }
                 var measuredHeight by remember { mutableIntStateOf(0) }
+                val pull = remember(request.owner) { Animatable(0f) }
                 val anchor = request.anchor ?: Rect(widthPx - margin, safeTop, widthPx - margin, safeTop + margin)
                 val x = (anchor.right - menuWidth).coerceIn(margin, (widthPx - margin - menuWidth).coerceAtLeast(margin))
                 val below = anchor.bottom + margin * .5f
                 val top = if (below + measuredHeight <= safeBottom) below else anchor.top - measuredHeight - margin * .5f
                 val y = top.coerceIn(safeTop, (safeBottom - measuredHeight).coerceAtLeast(safeTop))
                 val pivot = TransformOrigin(((anchor.center.x - x) / menuWidth).coerceIn(0f, 1f),
-                    if (y >= anchor.bottom) 0f else 1f)
+                    ((anchor.center.y - y) / measuredHeight.coerceAtLeast(1)).coerceIn(0f, 1f))
                 val shape = RoundedCornerShape(18.dp)
                 Column(Modifier.width(targetWidth)
                     .heightIn(max = with(density) { (safeBottom - safeTop).coerceAtLeast(100f).toDp() })
                     .onSizeChanged { measuredHeight = it.height }
                     .graphicsLayer {
-                        translationX = x
-                        translationY = y
+                        val p = progress.value
+                        translationX = x + (anchor.center.x - x - pivot.pivotFractionX * menuWidth) * (1f - p)
+                        translationY = y + (anchor.center.y - y - pivot.pivotFractionY * measuredHeight) * (1f - p) + pull.value
                         transformOrigin = pivot
-                        scaleX = .94f + .06f * progress.value
+                        scaleX = .94f + .06f * p
                         scaleY = scaleX
-                        alpha = progress.value
+                        alpha = p
                         this.shape = shape
                         shadowElevation = 16.dp.toPx()
                     }
-                    .onGloballyPositioned { menuCoords[0] = it }
-                    .clip(shape).drawBehind {
-                        val source = sceneCoords[0]
-                        val own = menuCoords[0]
-                        val available = Build.VERSION.SDK_INT >= 31 && source?.isAttached == true && own?.isAttached == true
-                        if (available) {
-                            val offset = source!!.localPositionOf(own!!, Offset.Zero)
-                            val pad = ceil(blurRadius * 3f)
-                            material.record(size = IntSize(ceil((size.width + pad * 2f) * .5f).toInt(),
-                                ceil((size.height + pad * 2f) * .5f).toInt())) {
-                                scale(.5f, pivot = Offset.Zero) {
-                                    translate(pad - offset.x, pad - offset.y) { drawLayer(scene) }
-                                }
-                            }
-                            translate(-pad, -pad) { scale(2f, pivot = Offset.Zero) { drawLayer(material) } }
-                        }
-                        drawRect(Color(0xFF28272C).copy(alpha = if (available) .75f else .98f))
-                    }.border(.5.dp, Color.White.copy(alpha = .15f), shape)
+                    .clip(shape).hazeEffect(backdrop, material)
+                    .border(.5.dp, Color.White.copy(alpha = .15f), shape)
+                    .menuDismissGesture(pull) { request.dismiss.value() }
                     .pointerInput(Unit) { detectTapGestures {} }
                     .verticalScroll(rememberScrollState()).semantics { paneTitle = "歌曲菜单" },
                 ) {
                     CompositionLocalProvider(LocalInsideContextMenu provides true) {
                         request.header.value?.invoke()
                         request.content.value(this)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/** Only unconsumed downward scroll at the content's top can move the popup. */
+@Composable
+private fun Modifier.menuDismissGesture(
+    pull: Animatable<Float, AnimationVector1D>,
+    onDismiss: () -> Unit,
+): Modifier {
+    val dismiss by rememberUpdatedState(onDismiss)
+    val scope = rememberCoroutineScope()
+    val threshold = with(LocalDensity.current) { 64.dp.toPx() }
+    val gestureState = remember(pull) { booleanArrayOf(false, false) }
+    val connection = remember(pull, scope, gestureState) {
+        object : NestedScrollConnection {
+            fun move(delta: Float): Offset {
+                if (!gestureState[0] || delta == 0f) return Offset.Zero
+                val target = (pull.value + delta).coerceAtLeast(0f)
+                val consumed = target - pull.value
+                if (consumed != 0f) gestureState[1] = true
+                scope.launch(start = CoroutineStart.UNDISPATCHED) { pull.snapTo(target) }
+                return Offset(0f, consumed)
+            }
+
+            override fun onPreScroll(available: Offset, source: NestedScrollSource): Offset =
+                if (source == NestedScrollSource.UserInput && pull.value > 0f) move(available.y) else Offset.Zero
+
+            override fun onPostScroll(consumed: Offset, available: Offset, source: NestedScrollSource): Offset =
+                if (source == NestedScrollSource.UserInput && available.y > 0f) move(available.y) else Offset.Zero
+
+            override suspend fun onPreFling(available: Velocity): Velocity =
+                if (pull.value > 0f) Velocity(0f, available.y) else Velocity.Zero
+        }
+    }
+    return nestedScroll(connection).pointerInput(pull, threshold) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            gestureState[0] = true
+            gestureState[1] = false
+            scope.launch(start = CoroutineStart.UNDISPATCHED) { pull.stop() }
+            val tracker = VelocityTracker().apply { addPointerInputChange(down) }
+            var released = false
+            try {
+                while (true) {
+                    val event = awaitPointerEvent(PointerEventPass.Final)
+                    val change = event.changes.firstOrNull { it.id == down.id } ?: break
+                    if (event.changes.any { it.id != down.id && (it.pressed || it.previousPressed) }) break
+                    tracker.addPointerInputChange(change)
+                    if (!change.pressed) {
+                        released = change.previousPressed
+                        break
+                    }
+                }
+            } finally {
+                gestureState[0] = false
+                if (pull.value > 0f) {
+                    val velocity = if (released) tracker.calculateVelocity().y else 0f
+                    if (released && gestureState[1] && velocity >= 0f && pull.value + velocity * .12f >= threshold) dismiss()
+                    scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                        pull.animateTo(0f, spring(dampingRatio = .9f, stiffness = 600f), initialVelocity = velocity)
                     }
                 }
             }
@@ -215,6 +273,6 @@ internal fun rememberMenuAnchor(): Pair<Modifier, () -> Unit> {
     val host = LocalContextMenuController.current
     val coordinates = remember { arrayOfNulls<LayoutCoordinates>(1) }
     return Modifier.onGloballyPositioned { coordinates[0] = it } to {
-        host?.lastAnchor = coordinates[0]?.takeIf { it.isAttached }?.boundsInRoot()
+        host?.pendingAnchor = coordinates[0]?.takeIf { it.isAttached }?.boundsInRoot()
     }
 }

@@ -1,7 +1,5 @@
 package com.example.xuebimc
 
-import androidx.compose.animation.ExperimentalSharedTransitionApi
-import androidx.compose.animation.SharedTransitionLayout
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.runtime.Composable
@@ -15,9 +13,10 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.staticCompositionLocalOf
-import androidx.compose.runtime.withFrameNanos
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.draw.drawWithContent
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Rect
@@ -34,21 +33,22 @@ import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
+import kotlinx.coroutines.flow.collect
+import kotlinx.coroutines.flow.distinctUntilChanged
 
 /**
  * Wrap the existing full-window app Box, OUTSIDE every hazeSource. Keep the mini composed until
  * playerExpansion reaches zero, and disable sharing for lyrics, queue and modal overlays.
  *
- * Both endpoints keep their existing TrackArtwork. We lift its already decoded display list;
+ * Both endpoints keep their existing TrackArtwork. We lift their already decoded display lists;
  * there is no third Image, bitmap readback, decode, timer or second spring. Only draw reads p.
  *
- * 1.7.7's sharedElementWithCallerManagedVisibility creates its own time-driven Transition.
- * It cannot seek to the existing drag p, and its lookahead cannot predict ancestor graphicsLayer
- * translations. Use the native root overlay, but drive the bounds from the SAME p as the sheet.
+ * A root sibling overlay follows the SAME p as the sheet, including reversed/cancelled drags.
+ * Decide ownership before drawing either endpoint. The mini is an immediate first-frame image;
+ * upgrading to the player's recorded layer never changes the chosen geometry or restarts p.
  * The defaults undo Main's centered .93 base scale and full-height player translation. If Main
  * changes either transform, supply the matching functions here; never ease p a second time.
  */
-@OptIn(ExperimentalSharedTransitionApi::class)
 @Composable
 internal fun SharedArtworkTransition(
     playerExpansion: () -> Float,
@@ -56,12 +56,14 @@ internal fun SharedArtworkTransition(
     enabled: Boolean = true,
     backgroundScale: (Float) -> Float = { 1f - .07f * it },
     playerTranslationY: (progress: Float, heightPx: Float) -> Float = { p, height -> (1f - p) * height },
+    onReadyForOpen: (String?) -> Unit = {},
     content: @Composable () -> Unit,
 ) {
     val progress = rememberUpdatedState(playerExpansion)
     val sharing = rememberUpdatedState(enabled)
     val baseScale = rememberUpdatedState(backgroundScale)
     val playerOffset = rememberUpdatedState(playerTranslationY)
+    val reportReady = rememberUpdatedState(onReadyForOpen)
     val host = remember {
         ArtworkTransfer(
             progress = { progress.value().coerceIn(0f, 1f) },
@@ -70,22 +72,25 @@ internal fun SharedArtworkTransition(
             playerOffset = { p, height -> playerOffset.value(p, height) },
         )
     }
-    SharedTransitionLayout(modifier.fillMaxSize()) {
-        Box(Modifier.fillMaxSize().onGloballyPositioned { host.root = it }) {
+    LaunchedEffect(host) {
+        // A registration fence, not a timer: Main may hold its existing p at zero until this key
+        // matches. Destination first draw is NOT required if the mini display list is available.
+        snapshotFlow { host.preparedKey() }.distinctUntilChanged().collect { reportReady.value(it) }
+    }
+        Box(modifier.fillMaxSize().onGloballyPositioned { host.root = it }.drawWithContent {
+            host.beginFrame()
+            drawContent()
+        }) {
             CompositionLocalProvider(LocalArtworkTransfer provides host, content = content)
             // This sibling is above player + base world and never inside their Haze sources.
             // No pointer input/semantics: the overlay cannot intercept controls or dismiss drag.
             Box(
                 Modifier.matchParentSize()
-                    .renderInSharedTransitionScopeOverlay(
-                        renderInOverlay = { host.frame() != null },
-                        zIndexInOverlay = 1f,
-                    )
                     .drawWithCache {
                         val clip = Path()
                         onDrawBehind {
                             val frame = host.frame() ?: return@onDrawBehind
-                            val layer = frame.destination.layer
+                            val layer = frame.layer
                             val width = layer.size.width.toFloat()
                             val height = layer.size.height.toFloat()
                             if (width <= 0f || height <= 0f) return@onDrawBehind
@@ -101,7 +106,6 @@ internal fun SharedArtworkTransition(
                     },
             )
         }
-    }
 }
 
 /** Mini hook: .size(...).sharedMiniArtwork(track, actualRadius).clip(actualShape). */
@@ -109,8 +113,9 @@ internal fun SharedArtworkTransition(
 internal fun Modifier.sharedMiniArtwork(track: Track?, cornerRadius: Dp = 6.dp): Modifier {
     val host = LocalArtworkTransfer.current ?: return this
     val key = track?.stableKey?.takeIf { it.isNotBlank() } ?: return this
+    val layer = rememberGraphicsLayer()
     val radius = with(LocalDensity.current) { cornerRadius.toPx() }
-    val source = remember(host, key) { ArtworkSource(key, radius) }
+    val source = remember(host, key, layer) { ArtworkSource(key, layer, radius) }
     SideEffect { source.radius = radius }
     DisposableEffect(host, source) {
         host.source = source
@@ -118,8 +123,10 @@ internal fun Modifier.sharedMiniArtwork(track: Track?, cornerRadius: Dp = 6.dp):
     }
     return this.onGloballyPositioned { source.coordinates = it }.drawWithCache {
         onDrawWithContent {
+            layer.record { this@onDrawWithContent.drawContent() }
+            source.recorded = true
             // An unavailable/mismatched destination always leaves the original mini visible.
-            if (host.frame() == null) drawContent()
+            if (host.frame() == null) drawLayer(layer)
         }
     }
 }
@@ -158,14 +165,6 @@ internal fun Modifier.sharedPlayerArtwork(
         host.destination = destination
         onDispose { if (host.destination === destination) host.destination = null }
     }
-    // Arm on the following frame, not halfway through drawing the first frame. Otherwise the
-    // mini may already have painted before the destination's display list becomes available.
-    LaunchedEffect(destination, destination.recorded) {
-        if (destination.recorded) {
-            withFrameNanos { }
-            destination.ready = true
-        }
-    }
     return drawWithCache {
         onDrawWithContent {
             layer.record { this@onDrawWithContent.drawContent() }
@@ -177,9 +176,10 @@ internal fun Modifier.sharedPlayerArtwork(
 
 private val LocalArtworkTransfer = staticCompositionLocalOf<ArtworkTransfer?> { null }
 
-private class ArtworkSource(val key: String, radius: Float) {
+private class ArtworkSource(val key: String, val layer: GraphicsLayer, radius: Float) {
     var coordinates by mutableStateOf<LayoutCoordinates?>(null)
     var radius by mutableStateOf(radius)
+    var recorded by mutableStateOf(false)
 }
 
 private class ArtworkViewport {
@@ -195,10 +195,9 @@ private class ArtworkDestination(
     var bounds by mutableStateOf(bounds)
     var radius by mutableStateOf(radius)
     var recorded by mutableStateOf(false)
-    var ready by mutableStateOf(false)
 }
 
-private data class ArtworkFrame(val destination: ArtworkDestination, val bounds: Rect, val radius: Float)
+private data class ArtworkFrame(val key: String, val layer: GraphicsLayer, val bounds: Rect, val radius: Float)
 
 private class ArtworkTransfer(
     val progress: () -> Float,
@@ -210,15 +209,62 @@ private class ArtworkTransfer(
     var source by mutableStateOf<ArtworkSource?>(null)
     var viewport by mutableStateOf<ArtworkViewport?>(null)
     var destination by mutableStateOf<ArtworkDestination?>(null)
+    private var decided = false
+    private var transferKey: String? = null
+    private var transferAllowed = false
+    private var drawingFrame: ArtworkFrame? = null
 
-    fun frame(): ArtworkFrame? {
+    fun preparedKey(): String? {
         if (!enabled()) return null
-        val p = progress()
-        // At either endpoint restore ordinary rendering, including original clipping/semantics.
-        if (!p.isFinite() || p <= 0f || p >= 1f) return null
         val small = source ?: return null
         val large = destination ?: return null
-        if (small.key != large.key || !large.ready || large.layer.isReleased) return null
+        if (small.key != large.key || root?.isAttached != true || small.coordinates?.isAttached != true ||
+            viewport?.coordinates?.isAttached != true || !large.bounds.usable()) return null
+        if (!small.layer.usable(small.recorded) && !large.layer.usable(large.recorded)) return null
+        return small.key
+    }
+
+    /** One decision for mini, player and overlay, made before any of them paints. */
+    fun beginFrame() {
+        val p = progress()
+        if (!p.isFinite() || p <= 0f || p >= 1f) {
+            decided = false
+            transferAllowed = false
+            transferKey = null
+            drawingFrame = null
+            return
+        }
+        val candidate = calculateFrame(p)
+        if (!decided) {
+            decided = true
+            transferAllowed = candidate != null
+            transferKey = candidate?.key
+        } else if (candidate == null || candidate.key != transferKey) {
+            transferAllowed = false
+        }
+        // If the regular cover already started this motion, never teleport it back to a
+        // mini-origin trajectory later. Main's readiness fence avoids that fallback on opening.
+        drawingFrame = candidate.takeIf { transferAllowed }
+    }
+
+    fun frame(): ArtworkFrame? {
+        // Read the same observable p in endpoint draw nodes too, so cached parent layers redraw
+        // at ownership changes. Recording a new destination cannot change this frame's owner.
+        progress()
+        enabled()
+        return drawingFrame
+    }
+
+    private fun calculateFrame(p: Float): ArtworkFrame? {
+        if (!enabled()) return null
+        val small = source ?: return null
+        val large = destination ?: return null
+        if (small.key != large.key) return null
+        val layer = when {
+            large.layer.usable(large.recorded) -> large.layer
+            small.layer.usable(small.recorded) -> small.layer
+            else -> return null
+        }
         val root = root?.takeIf { it.isAttached } ?: return null
         val mini = small.coordinates?.takeIf { it.isAttached } ?: return null
         val player = viewport?.coordinates?.takeIf { it.isAttached } ?: return null
@@ -236,12 +282,14 @@ private class ArtworkTransfer(
         val fullBounds = large.bounds.translate(playerOrigin)
         if (!miniBounds.usable() || !fullBounds.usable()) return null
         return ArtworkFrame(
-            large,
+            small.key, layer,
             lerp(miniBounds, fullBounds, p),
             (small.radius + (large.radius - small.radius) * p).coerceAtLeast(0f),
         )
     }
 }
+
+private fun GraphicsLayer.usable(recorded: Boolean) = recorded && !isReleased && size.width > 0 && size.height > 0
 
 private fun Rect.usable() = left.isFinite() && top.isFinite() && right.isFinite() &&
     bottom.isFinite() && width > 0f && height > 0f

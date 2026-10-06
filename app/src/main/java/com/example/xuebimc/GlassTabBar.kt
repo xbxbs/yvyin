@@ -74,6 +74,8 @@ private val MiniPlayerRadius = 20.dp
 private val MiniPlayerInset = 8.dp
 private val TabBarRadius = 29.dp
 private val TabBarInset = 4.dp
+private val NavigationItemWidth = 76.dp
+private val NavigationWidth = NavigationItemWidth * 3 + TabBarInset * 2
 
 enum class MusicTab { Library, Online, Settings }
 
@@ -105,25 +107,25 @@ fun GlassTabBar(
         spring(dampingRatio = .85f, stiffness = 380f), label = "bottomChromeCollapse")
     @Composable fun Tabs(modifier: Modifier = Modifier) {
         Row(
-            modifier.fillMaxWidth().height(58.dp)
+            modifier.width(NavigationWidth).height(58.dp)
                 .glassCapsule(backdrop, RoundedCornerShape(TabBarRadius)).padding(TabBarInset),
             verticalAlignment = Alignment.CenterVertically,
         ) {
             GlassTab("资料库", GlassTabIcon.Library, selected = selectedTab == MusicTab.Library,
-                onClick = { onSelectTab(MusicTab.Library) }, modifier = Modifier.weight(1f))
+                onClick = { onSelectTab(MusicTab.Library) }, modifier = Modifier.width(NavigationItemWidth))
             GlassTab("在线", GlassTabIcon.Online, selected = selectedTab == MusicTab.Online,
-                onClick = { onSelectTab(MusicTab.Online) }, modifier = Modifier.weight(1f))
+                onClick = { onSelectTab(MusicTab.Online) }, modifier = Modifier.width(NavigationItemWidth))
             GlassTab("设置", GlassTabIcon.Settings, selected = selectedTab == MusicTab.Settings,
-                onClick = { onSelectTab(MusicTab.Settings) }, modifier = Modifier.weight(1f))
+                onClick = { onSelectTab(MusicTab.Settings) }, modifier = Modifier.width(NavigationItemWidth))
         }
     }
     Column(
         modifier
             .widthIn(max = 520.dp)
-            .fillMaxWidth()
             .navigationBarsPadding()
             .padding(start = 16.dp, end = 16.dp, bottom = 12.dp),
         verticalArrangement = Arrangement.spacedBy(8.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
     ) {
         if (track == null) Tabs() else {
             Layout(
@@ -157,11 +159,11 @@ fun GlassTabBar(
                 val circleWidth = 56.dp.roundToPx()
                 val miniWidth = (width - ((circleWidth + gap) * p).roundToInt()).coerceAtLeast(1)
                 val mini = measurables[0].measure(Constraints.fixed(miniWidth, miniHeight))
-                val tabs = measurables[1].measure(Constraints.fixed(width, tabsHeight))
+                val tabs = measurables[1].measure(Constraints.fixed(minOf(width, NavigationWidth.roundToPx()), tabsHeight))
                 val circle = measurables[2].measure(Constraints.fixed(circleWidth, miniHeight))
                 layout(width, miniHeight + ((tabsHeight + gap) * (1f - p)).roundToInt()) {
                     mini.placeRelative(0, 0)
-                    tabs.placeRelativeWithLayer(0, miniHeight + gap) { alpha = 1f - p }
+                    tabs.placeRelativeWithLayer((width - tabs.width) / 2, miniHeight + gap) { alpha = 1f - p }
                     circle.placeRelativeWithLayer(width - circleWidth, 0) {
                         alpha = p
                         scaleX = .85f + .15f * p

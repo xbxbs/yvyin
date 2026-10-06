@@ -23,6 +23,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlin.math.abs
 
 private const val SEEK_INTERVAL_MS = 180L
 private const val REVEAL_INTERVAL_MS = 720L
@@ -77,6 +78,75 @@ internal class PlayerSeekGestureGuard {
 // Saturate before adding, so even an unusually large duration cannot overflow.
 private fun seekTarget(start: Long, amount: Long, duration: Long, forward: Boolean): Long =
     if (forward) start + minOf(amount, duration - start) else start - minOf(amount, start)
+
+/** Press feedback is immediate; only a horizontal drag or an uncancelled up changes the value. */
+@Composable
+internal fun Modifier.playerSliderGesture(
+    gesture: PlayerSeekGesture,
+    enabled: Boolean,
+    onInteractionChanged: (pressed: Boolean, dragging: Boolean) -> Unit,
+    onValueChange: (Float) -> Unit,
+): Modifier {
+    val currentGesture by rememberUpdatedState(gesture)
+    val currentEnabled by rememberUpdatedState(enabled)
+    val interaction by rememberUpdatedState(onInteractionChanged)
+    val changeValue by rememberUpdatedState(onValueChange)
+    val key = gesture.key
+    return pointerInput(key, gesture.guard, enabled) {
+        if (!enabled) return@pointerInput
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false)
+            if (down.isConsumed || currentEvent.changes.count { it.pressed } != 1 ||
+                down.position.x !in 0f..size.width.toFloat() ||
+                down.position.y !in 0f..size.height.toFloat()
+            ) return@awaitEachGesture
+            var cancelled = false
+            var dragging = false
+            val cancel: () -> Unit = {
+                cancelled = true
+                interaction(false, false)
+            }
+            if (!gesture.guard.acquire(cancel)) return@awaitEachGesture
+            try {
+                down.consume()
+                interaction(true, false)
+                while (true) {
+                    val event = awaitPointerEvent()
+                    val change = event.changes.firstOrNull { it.id == down.id }
+                    if (cancelled || !currentEnabled || currentGesture.key != key ||
+                        change == null || change.isConsumed ||
+                        event.changes.any { it.id != down.id && (it.pressed || it.previousPressed) }
+                    ) break
+                    val delta = change.position - down.position
+                    if (!dragging) {
+                        // Give vertical page gestures priority; never turn them into tap-to-seek.
+                        if (abs(delta.y) > viewConfiguration.touchSlop && abs(delta.y) >= abs(delta.x)) break
+                        if (abs(delta.x) > viewConfiguration.touchSlop) {
+                            dragging = true
+                            interaction(true, true)
+                        } else if (change.position.x !in 0f..size.width.toFloat() ||
+                            change.position.y !in 0f..size.height.toFloat()
+                        ) break
+                    }
+                    if (!change.pressed) {
+                        if (change.previousPressed) {
+                            change.consume()
+                            changeValue((change.position.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f))
+                        }
+                        break
+                    }
+                    if (dragging) {
+                        change.consume()
+                        changeValue((change.position.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f))
+                    }
+                }
+            } finally {
+                interaction(false, false)
+                gesture.guard.release(cancel)
+            }
+        }
+    }
+}
 
 @Composable
 internal fun Modifier.playerSeekGesture(

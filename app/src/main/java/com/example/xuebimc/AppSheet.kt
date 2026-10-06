@@ -30,13 +30,17 @@ import androidx.compose.runtime.getValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.paneTitle
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -100,6 +104,7 @@ internal fun SheetActionRow(
     label: String,
     icon: PlayerIconType? = null,
     selected: Boolean = false,
+    filledStar: Boolean = false,
     onClick: () -> Unit,
 ) {
     Row(
@@ -110,12 +115,14 @@ internal fun SheetActionRow(
         BasicText(
             label, Modifier.weight(1f), maxLines = 2, overflow = TextOverflow.Ellipsis,
             style = TextStyle(color = if (selected) LibraryAccent else Color.White.copy(alpha = .94f),
-                fontSize = 17.sp, lineHeight = 22.sp, fontFamily = PlayerTypography.latin),
+                fontSize = 17.sp, lineHeight = 22.sp, fontFamily = PlayerTypography.latin,
+                fontWeight = FontWeight.Normal),
         )
         if (icon != null) {
             Spacer(Modifier.width(16.dp))
             PlayerIcon(icon, Modifier.size(20.dp),
-                tint = if (selected) LibraryAccent else Color.White.copy(alpha = .66f), filled = selected)
+                tint = Color.White.copy(alpha = .60f),
+                filled = selected || (icon == PlayerIconType.Star && filledStar))
         }
     }
 }
@@ -128,5 +135,15 @@ internal fun SheetActionGroup(content: @Composable ColumnScope.() -> Unit) {
 
 @Composable
 internal fun SheetActionDivider() {
-    Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(.5.dp).background(Color.White.copy(alpha = .10f)))
+    // A fractional dp height rounds to a whole layout pixel; draw the 0.5px stroke explicitly.
+    val pixel = with(LocalDensity.current) { 1f.toDp() }
+    Box(Modifier.padding(start = 16.dp).fillMaxWidth().height(pixel).drawBehind {
+        drawLine(Color.White.copy(alpha = .10f), Offset(0f, size.height / 2f),
+            Offset(size.width, size.height / 2f), strokeWidth = .5f)
+    })
+}
+
+@Composable
+internal fun SheetActionSectionDivider() {
+    Box(Modifier.fillMaxWidth().height(8.dp).background(Color.Black.copy(alpha = .18f)))
 }

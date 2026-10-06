@@ -11,8 +11,6 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.basicMarquee
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
@@ -59,6 +57,7 @@ import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.PointerEventPass
 import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.platform.LocalViewConfiguration
 import androidx.compose.ui.platform.ViewConfiguration
 import androidx.compose.ui.semantics.clearAndSetSemantics
@@ -78,6 +77,7 @@ import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.compose.ui.zIndex
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.launch
 
 @Composable
@@ -190,7 +190,7 @@ fun PlayerScreen(
     val fullCoverAtRest by remember {
         derivedStateOf { transition.value.x <= .001f && transition.value.y <= .001f }
     }
-    val controlsEnabled = showControls && controlsPresent
+    val controlsEnabled = showControls && controlsPresent && !contextMenuOpen
     val seekGestureGuard = remember { PlayerSeekGestureGuard() }
     val seekGesture = PlayerSeekGesture(
         key = PlayerSeekGestureKey(playbackItemKey, durationMs, lyricsVisible, queueVisible),
@@ -413,6 +413,7 @@ fun PlayerScreen(
             pageWidth = pageWidth,
             pageHeight = pageHeight,
             enabled = controlsEnabled,
+            gesture = seekGesture,
         )
         if (qualityLabel != null) {
             PlayerQualityBadge(
@@ -441,20 +442,44 @@ fun PlayerScreen(
             iconSize = designSize(41f), touchSize = 60.dp, enabled = controlsEnabled,
             seekGesture = seekGesture
         )
+        val volumeEndpoint = remember { intArrayOf(0) }
+        val lowVolumeScale = remember { Animatable(1f) }
+        val highVolumeScale = remember { Animatable(1f) }
+        val volumeScope = rememberCoroutineScope()
         PlayerIcon(
             PlayerIconType.VolumeLow,
-            Modifier.offset(pageWidth * .084f - designSize(11f), pageHeight * .886f - designSize(11f)).size(designSize(22f)),
+            Modifier.offset(pageWidth * .084f - designSize(11f), pageHeight * .886f - designSize(11f)).size(designSize(22f))
+                .graphicsLayer { scaleX = lowVolumeScale.value; scaleY = scaleX },
             softWhite
         )
         PlayerSlider(
             value = volume, onValueChange = onVolumeChange, description = "音量",
             modifier = Modifier.offset(pageWidth * .134f, pageHeight * .886f - 22.dp)
                 .width(pageWidth * .718f).height(44.dp),
-            enabled = controlsEnabled, trackThickness = designSize(7f)
+            enabled = controlsEnabled, trackThickness = designSize(7f), gesture = seekGesture,
+            onTouchStateChanged = { pressed, value ->
+                val endpoint = when {
+                    !pressed -> 0
+                    value <= 0f -> -1
+                    value >= 1f -> 1
+                    else -> 0
+                }
+                if (endpoint != 0 && endpoint != volumeEndpoint[0]) {
+                    val scale = if (endpoint < 0) lowVolumeScale else highVolumeScale
+                    // A spring impulse returns itself to rest, including a tap-up at the endpoint.
+                    // Retarget from the live scale/velocity; no reset, replay timer, or held enlargement.
+                    volumeScope.launch(start = CoroutineStart.UNDISPATCHED) {
+                        scale.animateTo(1f, spring(dampingRatio = .6f, stiffness = 700f),
+                            initialVelocity = (scale.velocity.coerceAtLeast(0f) + 3.5f).coerceAtMost(6f))
+                    }
+                }
+                volumeEndpoint[0] = endpoint
+            },
         )
         PlayerIcon(
             PlayerIconType.VolumeHigh,
-            Modifier.offset(pageWidth * .909f - designSize(11f), pageHeight * .886f - designSize(11f)).size(designSize(22f)),
+            Modifier.offset(pageWidth * .909f - designSize(11f), pageHeight * .886f - designSize(11f)).size(designSize(22f))
+                .graphicsLayer { scaleX = highVolumeScale.value; scaleY = scaleX },
             softWhite
         )
         PlayerButton(
@@ -555,6 +580,7 @@ private fun PlayerTimeline(
     pageWidth: Dp,
     pageHeight: Dp,
     enabled: Boolean,
+    gesture: PlayerSeekGesture,
 ) {
     val duration = durationMs.coerceAtLeast(0L)
     // Keep frame-by-frame snapshot reads out of PlayerScreen's composition scope.
@@ -574,6 +600,7 @@ private fun PlayerTimeline(
             .width(pageWidth * .866f).height(44.dp),
         enabled = enabled && duration > 0,
         trackThickness = pageWidth * (7f / 390f),
+        gesture = gesture,
     )
     BasicText(
         playerTime(position),
@@ -641,13 +668,14 @@ private fun PlayerButton(
 ) {
     val interaction = remember { MutableInteractionSource() }
     val menuAnchor = rememberMenuAnchor()
+    val opensMenu = icon == PlayerIconType.More || icon == PlayerIconType.MoreVertical || icon == PlayerIconType.AirPlay
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(
         targetValue = if (pressed && enabled) .87f else 1f,
         animationSpec = spring(dampingRatio = .66f, stiffness = 650f)
     )
     Box(
-        modifier.size(touchSize).then(if (icon == PlayerIconType.More || icon == PlayerIconType.MoreVertical) menuAnchor.first else Modifier)
+        modifier.size(touchSize).then(if (opensMenu) menuAnchor.first else Modifier)
             .semantics { contentDescription = description }
             .then(
                 if (seekGesture != null) Modifier.playerSeekGesture(
@@ -658,7 +686,7 @@ private fun PlayerButton(
                     onClick = onClick,
                 ) else if (enabled) Modifier.clickable(
                     interactionSource = interaction, indication = null, role = Role.Button, onClick = {
-                        if (icon == PlayerIconType.More || icon == PlayerIconType.MoreVertical) menuAnchor.second()
+                        if (opensMenu) menuAnchor.second()
                         onClick()
                     }
                 ) else Modifier.clearAndSetSemantics { }
@@ -687,57 +715,54 @@ private fun PlayerSlider(
     description: String,
     modifier: Modifier = Modifier,
     enabled: Boolean = true,
-    trackThickness: Dp = 3.5.dp
+    trackThickness: Dp = 3.5.dp,
+    gesture: PlayerSeekGesture,
+    onTouchStateChanged: (Boolean, Float) -> Unit = { _, _ -> },
 ) {
     val callback by rememberUpdatedState(onValueChange)
-    val canChange by rememberUpdatedState(enabled)
+    val touchStateChanged by rememberUpdatedState(onTouchStateChanged)
+    val view = LocalView.current
+    var pressed by remember { mutableStateOf(false) }
     var dragging by remember { mutableStateOf(false) }
     var dragValue by remember { mutableFloatStateOf(0f) }
-    LaunchedEffect(enabled) {
-        if (!enabled) dragging = false
-    }
     val externalValue = if (value.isFinite()) value.coerceIn(0f, 1f) else 0f
     val shownValue = if (dragging) dragValue else externalValue
-    val thickness by animateFloatAsState(
-        if (dragging && enabled) trackThickness.value * 1.3f else trackThickness.value,
-        animationSpec = spring(dampingRatio = .85f, stiffness = 550f)
+    val thicknessScale = animateFloatAsState(
+        if (pressed && enabled) 1.3f else 1f,
+        animationSpec = spring(dampingRatio = .85f, stiffness = 900f), label = "sliderPress",
     )
-    Canvas(
+    Box(
         modifier.semantics {
             contentDescription = description
             progressBarRangeInfo = ProgressBarRangeInfo(shownValue, 0f..1f)
             setProgress { requested ->
-                if (enabled) callback(requested.coerceIn(0f, 1f))
-                enabled
+                if (enabled && requested.isFinite()) {
+                    gesture.guard.cancel()
+                    callback(requested.coerceIn(0f, 1f))
+                    true
+                } else false
             }
-        }.pointerInput(enabled) {
-            if (!enabled) return@pointerInput
-            detectTapGestures { point ->
-                if (canChange) callback((point.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f))
-            }
-        }.pointerInput(enabled) {
-            if (!enabled) return@pointerInput
-            detectDragGestures(
-                onDragStart = { point ->
-                    if (canChange) {
-                        dragging = true
-                        dragValue = (point.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
-                        callback(dragValue)
-                    }
-                },
-                onDragEnd = { dragging = false },
-                onDragCancel = { dragging = false },
-                onDrag = { change, _ ->
-                    if (canChange) {
-                        change.consume()
-                        dragValue = (change.position.x / size.width.coerceAtLeast(1)).coerceIn(0f, 1f)
-                        callback(dragValue)
-                    }
+        }.playerSliderGesture(
+            gesture = gesture, enabled = enabled,
+            onInteractionChanged = { isPressed, isDragging ->
+                if (isPressed && !pressed) {
+                    dragValue = externalValue
+                    view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
                 }
-            )
-        }
+                pressed = isPressed
+                dragging = isDragging
+                touchStateChanged(isPressed, if (isDragging) dragValue else externalValue)
+            },
+            onValueChange = { changed ->
+                dragValue = changed
+                callback(changed)
+                touchStateChanged(pressed, changed)
+            },
+        ),
     ) {
-        val trackHeight = thickness.dp.toPx().coerceAtMost(size.height)
+      // Only the paint layer grows; the slider's touch bounds and surrounding layout stay fixed.
+      Canvas(Modifier.fillMaxSize().graphicsLayer { scaleY = thicknessScale.value }) {
+        val trackHeight = trackThickness.toPx().coerceAtMost(size.height)
         val trackTop = (size.height - trackHeight) / 2
         val corner = CornerRadius(trackHeight / 2)
         drawRoundRect(Color.White.copy(alpha = .28f), Offset(0f, trackTop), Size(size.width, trackHeight), corner)
@@ -751,11 +776,12 @@ private fun PlayerSlider(
             }
             clipPath(clip) {
                 drawRect(
-                    Color.White.copy(alpha = if (dragging) .85f else .5f),
+                    Color.White.copy(alpha = if (pressed) .85f else .5f),
                     Offset(0f, trackTop), Size(size.width * shownValue, trackHeight)
                 )
             }
         }
+      }
     }
 }
 

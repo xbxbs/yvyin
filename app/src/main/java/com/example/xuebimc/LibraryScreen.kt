@@ -196,11 +196,13 @@ internal fun LibrarySurface(
     backdropVisible: Boolean = true,
     backdrop: HazeState? = null,
     onScrollDirection: (Boolean) -> Unit = {},
+    openRequest: LibraryOpenRequest? = null,
 ) {
     var query by rememberSaveable { mutableStateOf("") }
     var sort by rememberSaveable { mutableStateOf(LibrarySort.Title) }
     var browseKind by rememberSaveable { mutableStateOf<LibraryBrowseKind?>(null) }
     var groupKey by rememberSaveable { mutableStateOf<String?>(null) }
+    var handledOpenRequestId by rememberSaveable { mutableStateOf<Long?>(null) }
     var searchFocused by remember { mutableStateOf(false) }
     var menuOpen by remember { mutableStateOf(false) }
     var sheetShowing by remember { mutableStateOf(false) }
@@ -317,6 +319,26 @@ internal fun LibrarySurface(
         value = withContext(Dispatchers.Default) { buildLibraryIndex(tracks, sort) }
     }
     val readyIndex = index?.takeIf { it.source === tracks && it.sort == sort }
+    LaunchedEffect(openRequest?.id, isActive, readyIndex) {
+        val request = openRequest ?: return@LaunchedEffect
+        val ready = readyIndex ?: return@LaunchedEffect
+        if (!isActive || showSongsOnly || handledOpenRequestId == request.id) return@LaunchedEffect
+        val kind = if (request.artist) LibraryBrowseKind.Artists else LibraryBrowseKind.Albums
+        val key = if (request.artist) libraryArtistKey(request.track) else libraryAlbumKey(request.track)
+        val destination = withContext(Dispatchers.Default) {
+            val groups = ready.groups[kind].orEmpty()
+            val stableKey = request.track.stableKey
+            // Metadata may have changed since the player captured this track.
+            groups.firstOrNull { candidate ->
+                ensureActive()
+                candidate.tracks.any { it.stableKey == stableKey }
+            } ?: groups.firstOrNull { it.key == key }
+        }
+        // A missing destination stays on the real group list, never a synthetic collection.
+        browse(kind, destination?.key)
+        handledOpenRequestId = request.id
+        if (destination == null) showFeedback("资料库中未找到该${kind.label}") else feedback = null
+    }
     val group = browseKind?.let { readyIndex?.groups?.get(it) }?.firstOrNull { it.key == groupKey }
     val pageTitle = if (groupKey != null) group?.title ?: "歌曲" else browseKind?.label ?: if (showSongsOnly) "歌曲" else "资料库"
     val browsingGroups = browseKind != null && groupKey == null
@@ -352,31 +374,19 @@ internal fun LibrarySurface(
     val currentKey = currentTrack?.stableKey
     val density = LocalDensity.current
     var topBarHeight by remember { mutableStateOf(56.dp) }
-    var searchHeight by remember { mutableStateOf(48.dp) }
     val headerFeatherHeight = 24.dp
     val ownBackdrop = remember { HazeState() }
     // An external state lets the header and bottom bar sample this body once, without
     // an ancestor source recording the header's own blur/scrim into another source.
     val headerBackdrop = backdrop ?: ownBackdrop
-    val searchTopPx by remember(listState, density) {
-        derivedStateOf {
-            val info = listState.layoutInfo
-            val search = info.visibleItemsInfo.firstOrNull { it.key == "library:search" }
-            val heading = info.visibleItemsInfo.firstOrNull { it.key == "library:heading" }
-            val top = with(density) { topBarHeight.roundToPx() }
-            val searchOffset = search?.offset ?: heading?.let { it.offset + it.size }
-            val naturalTop = searchOffset?.plus(info.beforeContentPadding)
-                ?: (top - with(density) { searchHeight.roundToPx() })
-            if (searchFocused) naturalTop.coerceAtLeast(top) else naturalTop
-        }
-    }
     val collapsed by remember(listState, density) {
         derivedStateOf {
             val info = listState.layoutInfo
-            val search = info.visibleItemsInfo.firstOrNull { it.key == "library:search" }
-            // Include the feather inset when deciding whether search has reached the toolbar.
-            search?.let {
-                it.offset + info.beforeContentPadding <= with(density) { topBarHeight.roundToPx() }
+            val heading = info.visibleItemsInfo.firstOrNull { it.key == "library:heading" }
+            // Only the large title controls the compact title. Search is ordinary list
+            // content and never acquires an independently reconstructed screen position.
+            heading?.let {
+                it.offset + it.size + info.beforeContentPadding <= with(density) { topBarHeight.roundToPx() }
             } ?: (listState.firstVisibleItemIndex > 0)
         }
     }
@@ -397,7 +407,7 @@ internal fun LibrarySurface(
             LazyColumn(
                 state = listState,
                 modifier = Modifier.fillMaxSize().semantics { paneTitle = pageTitle }
-                    // Foreground navigation and search never feed back into the source.
+                    // The list (including search) is the source; the glass header is its sibling.
                     .then(if (sampleBackdrop) Modifier.hazeSource(headerBackdrop,
                         zIndex = if (showSongsOnly) 1f else 0f) else Modifier),
                 // The parent already includes its floating bar + system navigation in bottomInset.
@@ -409,9 +419,13 @@ internal fun LibrarySurface(
                 item(key = "library:heading", contentType = "heading") {
                     LibraryText(pageTitle, Modifier.padding(top = 2.dp, bottom = 12.dp), size = 34.sp, bold = true, maxLines = 2)
                 }
-                item(key = "library:search", contentType = "search-space") {
-                    // The clear search field lives outside the Haze source, at this item's position.
-                    Spacer(Modifier.fillMaxWidth().height(searchHeight))
+                item(key = "library:search", contentType = "search") {
+                    Box(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
+                        LibrarySearchField(query, searchFocused,
+                            onQueryChange = { query = it },
+                            onFocusChange = { searchFocused = it },
+                            onCancel = ::cancelSearch)
+                    }
                 }
                 if (!showSongsOnly && browseKind == null && searchTerm.isEmpty()) {
                     item(key = "library:browse", contentType = "browse") {
@@ -534,28 +548,11 @@ internal fun LibrarySurface(
             }
             MusicHeaderGlass(
                 backdrop = headerBackdrop,
-                // One top-anchored material, never a second floating full-width scrim.
-                // The search surface is opaque on its own while travelling to the top.
-                headerHeight = topBarHeight + if (searchFocused && collapsed) searchHeight else 0.dp,
+                // Only the toolbar owns an overlay; search scrolls and clips with its row.
+                headerHeight = topBarHeight,
                 featherHeight = headerFeatherHeight,
                 enabled = sampleBackdrop,
             )
-            // Search scrolls away with the large heading, clipped above the compact toolbar.
-            // Keeping field and clipping in one layer avoids reintroducing the detached black band.
-            Box(Modifier.fillMaxSize().padding(top = topBarHeight).clipToBounds()) {
-            Box(
-                Modifier.fillMaxWidth()
-                    // Placement and drawing, not composition, observe the per-frame search position.
-                    .offset { IntOffset(0, searchTopPx - with(density) { topBarHeight.roundToPx() }) }
-                    .onSizeChanged { searchHeight = with(density) { it.height.toDp() } }
-                    // Preserve dragging the old sticky search area to scroll the list.
-                    .scrollable(listState, Orientation.Vertical, enabled = isActive, reverseDirection = true)
-                    .padding(start = 18.dp, end = 18.dp, bottom = 12.dp),
-            ) {
-                LibrarySearchField(query, searchFocused,
-                    onQueryChange = { query = it }, onFocusChange = { searchFocused = it }, onCancel = ::cancelSearch)
-            }
-            }
             Row(
                 Modifier.fillMaxWidth().heightIn(min = 56.dp)
                     .onSizeChanged { topBarHeight = with(density) { it.height.toDp() } }
@@ -1194,7 +1191,8 @@ private fun LibraryAlphabetRail(
     var pressedLetter by remember { mutableStateOf<Char?>(null) }
     BoxWithConstraints(modifier) {
         Column(
-            Modifier.align(Alignment.Center).fillMaxWidth().height(maxHeight.coerceAtMost(432.dp))
+            // Keep a forgiving gesture rail, but only a 12 dp, quiet visual column.
+            Modifier.align(Alignment.Center).fillMaxWidth().height(maxHeight.coerceAtMost(270.dp))
                 .semantics {
                     contentDescription = "歌曲快速索引"
                     customActions = LibraryAlphabet.filter { it in targets }.map { letter ->
@@ -1233,12 +1231,18 @@ private fun LibraryAlphabetRail(
         ) {
             LibraryAlphabet.forEach { letter ->
                 Box(Modifier.fillMaxWidth().weight(1f).clearAndSetSemantics {}, contentAlignment = Alignment.Center) {
-                    LibraryText(letter.toString(), size = 11.sp, semibold = true,
-                        color = when {
-                            letter == pressedLetter -> Color.White
-                            letter in targets -> LibraryAccent
-                            else -> LibraryTertiary
-                        }, align = TextAlign.Center)
+                    BasicText(letter.toString(), Modifier.width(12.dp), maxLines = 1, softWrap = false,
+                        style = TextStyle(
+                            color = when {
+                                letter == pressedLetter -> LibraryAccent
+                                letter in targets -> LibrarySecondary
+                                else -> LibraryTertiary
+                            },
+                            fontSize = 9.sp, lineHeight = 10.sp,
+                            fontFamily = FontFamily.SansSerif, fontWeight = FontWeight.Normal,
+                            fontSynthesis = FontSynthesis.None, textAlign = TextAlign.Center,
+                            platformStyle = PlatformTextStyle(includeFontPadding = false),
+                        ))
                 }
             }
         }
