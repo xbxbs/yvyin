@@ -64,6 +64,7 @@ internal fun libraryAlbumKey(track: Track): String = if (track.albumId > 0) {
 private fun libraryFolder(track: Track): String? {
     val path = track.relativePath?.trim()?.trimEnd('/')?.takeIf { it.isNotEmpty() }
     if (path != null) return path
+    track.folderPath?.takeIf { it.isNotBlank() }?.let { return it }
     // A content URI is not a filesystem path. Do not invent a folder for imported documents.
     if (track.uri.scheme == "file") return track.uri.path?.substringBeforeLast('/', "")?.ifBlank { null }
     return null
@@ -85,11 +86,14 @@ internal suspend fun buildLibraryIndex(tracks: List<Track>, sort: LibrarySort): 
         collator.compare(libraryTitle(a), libraryTitle(b)).takeIf { it != 0 }
             ?: a.stableKey.compareTo(b.stableKey)
     }
-    // Track has no addedAt field. Only MediaStore ids are a useful approximation;
-    // imported ids are hashes, so retain their source order instead of treating them as dates.
-    val mediaTracks = tracks.filter { it.uri.authority == "media" && it.id >= 0 }
-    val mediaKeys = mediaTracks.mapTo(HashSet()) { it.stableKey }
-    val recent = mediaTracks.sortedByDescending { it.id }
+    // MediaStore's real DATE_ADDED and explicitly recorded imports/downloads only.
+    // Old imports have unknown time: sort them last and never imply they were just added.
+    val recentOrder = Comparator<Track> { a, b ->
+        active.ensureActive()
+        compareLibraryAddedAt(a.addedAtMs, b.addedAtMs).takeIf { it != 0 }
+            ?: titleOrder.compare(a, b)
+    }
+    val recent = tracks.filter { it.addedAtMs > 0L }.sortedWith(recentOrder)
     val ordered = when (sort) {
         LibrarySort.Title -> tracks.sortedWith(titleOrder)
         LibrarySort.Artist -> tracks.sortedWith(Comparator { a, b ->
@@ -97,7 +101,7 @@ internal suspend fun buildLibraryIndex(tracks: List<Track>, sort: LibrarySort): 
             collator.compare(libraryArtist(a), libraryArtist(b)).takeIf { it != 0 }
                 ?: titleOrder.compare(a, b)
         })
-        LibrarySort.Recent -> recent + tracks.filter { it.stableKey !in mediaKeys }
+        LibrarySort.Recent -> tracks.sortedWith(recentOrder)
     }
     val groups = LibraryBrowseKind.entries.associateWith { kind ->
         ordered.groupBy { track ->

@@ -5,9 +5,13 @@ import java.io.ByteArrayOutputStream
 import java.io.IOException
 import java.io.InputStream
 import java.io.InterruptedIOException
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.file.Files
+import java.util.Base64
 
-/** Pure JVM check: compile with MusicDownloads.kt, Android compile stubs and the app's Track/Prefs.
- * No emulator, network, DownloadManager, real files or Android runtime is used by these assertions.
+/** JVM check: compile with MusicDownloads.kt, MusicMetadataEmbedder.kt, jaudiotagger and Android stubs.
+ * No emulator, network, DownloadManager or Android runtime; the tag fixture uses temporary WAV/PNG files.
  * Device-only: persisted grants/revocation, provider errors, broadcasts, reboot/job scheduling.
  */
 fun main() {
@@ -65,5 +69,34 @@ fun main() {
     check(interrupted.size() in 1 until bytes.size)
     check(compare(interrupted.toByteArray()) == MusicDownloadRules.CopyMatch.PREFIX)
     check(bytes.contentEquals(ByteArray(150_123) { (it % 251).toByte() })) // source never mutated
-    println("MusicDownloadsCheck OK: formats/names, task ownership, verified copy/recovery, errors/cancellation")
+
+    check(MusicDownloads.Options().embedCover && MusicDownloads.Options().embedLyrics)
+    check(MusicDownloads.State.COMPLETE_WITH_WARNINGS != MusicDownloads.State.COMPLETE)
+    val fixture = Files.createTempDirectory("music-embedded-tags-").toFile()
+    // One second of valid, silent PCM: actual tag writing/read-back, no emulator or network.
+    val pcm = ByteArray(44 + 44_100 * 2)
+    ByteBuffer.wrap(pcm).order(ByteOrder.LITTLE_ENDIAN).apply {
+        put("RIFF".toByteArray()); putInt(pcm.size - 8); put("WAVEfmt ".toByteArray())
+        putInt(16); putShort(1); putShort(1); putInt(44_100); putInt(88_200)
+        putShort(2); putShort(16); put("data".toByteArray()); putInt(pcm.size - 44)
+    }
+    val original = fixture.resolve("source.wav").apply { writeBytes(pcm) }
+    val cover = fixture.resolve("cover.png").apply { writeBytes(Base64.getDecoder().decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aJ1kAAAAASUVORK5CYII=")) }
+    val metadata = MusicMetadataEmbedder.Metadata("测试歌曲", "测试歌手", "测试专辑", "[00:00.000]中文歌词", cover, true, true)
+    val result = MusicMetadataEmbedder.prepare(original, "fixture", metadata) {}
+    check(result.warning == null) { "Real WAV embed failed: ${result.warning}" }
+    check(result.file != original && result.file.length() > original.length())
+    check(original.readBytes().contentEquals(pcm)) // source is never rewritten
+    val reread = org.jaudiotagger.audio.AudioFileIO.read(result.file)
+    check(reread.tag.getFirst(org.jaudiotagger.tag.FieldKey.LYRICS) == metadata.lyrics)
+    check(reread.tag.firstArtwork.binaryData.contentEquals(cover.readBytes()))
+    val omitted = MusicMetadataEmbedder.prepare(original, "without-metadata", metadata.copy(coverFile = null, lyrics = "")) {}
+    check(omitted.warning?.contains("未取得歌词") == true && omitted.warning.contains("未取得封面"))
+    val disabled = MusicMetadataEmbedder.prepare(original, "disabled", metadata.copy(embedCover = false, embedLyrics = false)) {}
+    check(disabled.file == original && disabled.warning == null)
+    val wrongType = fixture.resolve("wrong.mp3").apply { writeText("<html>not audio</html>") }
+    check(runCatching { MusicMetadataEmbedder.prepare(wrongType, "wrong", metadata) {} }
+        .exceptionOrNull() is InvalidMusicDownloadException)
+    println("MusicDownloadsCheck OK: formats/names, ownership, verified recovery, cancellation, real embedded WAV cover+lyrics round-trip; fixtures=$fixture")
 }

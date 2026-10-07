@@ -18,7 +18,7 @@ import kotlin.math.cos
 import kotlin.math.sin
 
 enum class PlayerIconType {
-    Play, Pause, Previous, Next, Star, More, MoreVertical, Lyrics, VolumeLow, VolumeHigh, AirPlay, Queue, Lossless, Share, Info, Download, Album, Artist, AddToPlaylist, Settings
+    Play, Pause, Previous, Next, Star, More, MoreVertical, Lyrics, VolumeLow, VolumeHigh, AirPlay, Queue, Shuffle, Repeat, RepeatOne, Infinity, Lossless, Share, Info, Download, Album, Artist, AddToPlaylist, Settings
 }
 
 @Composable
@@ -219,6 +219,39 @@ fun PlayerIcon(
                         drawCircle(tint, 1.4f, Offset(3f, centerY))
                         drawLine(tint, Offset(8f, centerY), Offset(22f, centerY), 1.6f, StrokeCap.Round)
                     }
+                }
+                PlayerIconType.Shuffle -> {
+                    drawPath(Path().apply {
+                        moveTo(3f, 6f); lineTo(5f, 6f)
+                        cubicTo(10f, 6f, 14f, 18f, 19f, 18f); lineTo(21f, 18f)
+                        moveTo(3f, 18f); lineTo(5f, 18f)
+                        cubicTo(7f, 18f, 8.5f, 16f, 9.5f, 14.5f)
+                        moveTo(14.5f, 9.5f); cubicTo(16f, 7f, 17f, 6f, 19f, 6f); lineTo(21f, 6f)
+                        moveTo(18f, 3f); lineTo(21f, 6f); lineTo(18f, 9f)
+                        moveTo(18f, 15f); lineTo(21f, 18f); lineTo(18f, 21f)
+                    }, tint, style = outline)
+                }
+                PlayerIconType.Repeat, PlayerIconType.RepeatOne -> {
+                    drawPath(Path().apply {
+                        moveTo(4f, 11f); lineTo(4f, 9f)
+                        quadraticTo(4f, 6f, 7f, 6f); lineTo(20f, 6f)
+                        moveTo(20f, 13f); lineTo(20f, 15f)
+                        quadraticTo(20f, 18f, 17f, 18f); lineTo(4f, 18f)
+                        moveTo(17f, 3f); lineTo(20f, 6f); lineTo(17f, 9f)
+                        moveTo(7f, 15f); lineTo(4f, 18f); lineTo(7f, 21f)
+                        if (icon == PlayerIconType.RepeatOne) {
+                            moveTo(10.5f, 10.5f); lineTo(12.5f, 9.5f); lineTo(12.5f, 14.5f)
+                        }
+                    }, tint, style = outline)
+                }
+                PlayerIconType.Infinity -> {
+                    drawPath(Path().apply {
+                        moveTo(12f, 12f)
+                        cubicTo(8.5f, 6f, 2f, 5.7f, 2f, 12f)
+                        cubicTo(2f, 18.3f, 8.5f, 18f, 12f, 12f)
+                        cubicTo(15.5f, 6f, 22f, 5.7f, 22f, 12f)
+                        cubicTo(22f, 18.3f, 15.5f, 18f, 12f, 12f)
+                    }, tint, style = outline)
                 }
                 PlayerIconType.Lossless -> {
                     for (index in 0..3) {

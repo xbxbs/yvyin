@@ -27,6 +27,9 @@ object TrackJson {
         putNullable("codecMimeType", track.codecMimeType)
         putNullable("genre", track.genre)
         put("bitrate", track.bitrate)
+        put("metadataRevision", track.metadataRevision)
+        put("addedAtMs", track.addedAtMs)
+        putNullable("folderPath", track.folderPath)
     }
 
     fun fromJson(json: JSONObject): Track {
@@ -54,6 +57,9 @@ object TrackJson {
             codecMimeType = json.nullableString("codecMimeType"),
             genre = json.nullableString("genre"),
             bitrate = json.optLong("bitrate", 0L).coerceAtLeast(0L),
+            metadataRevision = json.optString("metadataRevision", ""),
+            addedAtMs = json.optLong("addedAtMs", 0L).coerceAtLeast(0L),
+            folderPath = json.nullableString("folderPath"),
         )
     }
 }

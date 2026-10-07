@@ -17,7 +17,7 @@ data class AudioQuality(
     val badgeLabel: String?
         get() = when (level) {
             AudioQualityLevel.HiResLossless -> "高解析度无损"
-            AudioQualityLevel.Lossless -> "无损音频"
+            AudioQualityLevel.Lossless -> "无损"
             AudioQualityLevel.Dsd -> "DSD"
             AudioQualityLevel.Lossy, AudioQualityLevel.Unknown -> null
         }
@@ -34,7 +34,8 @@ data class AudioQuality(
                 AudioQualityLevel.HiResLossless -> add("高解析度无损")
                 AudioQualityLevel.Lossless -> add("无损音频")
                 AudioQualityLevel.Dsd -> add("DSD")
-                AudioQualityLevel.Lossy, AudioQualityLevel.Unknown -> Unit
+                AudioQualityLevel.Lossy -> add("有损音频")
+                AudioQualityLevel.Unknown -> add("编码未验证")
             }
             if (bitrate > 0) add("${bitrate / 1000} kbps")
         }.joinToString(" · ")
@@ -47,15 +48,19 @@ val Track.audioQuality: AudioQuality
         // is not confirmation; ordinary formats can still be described without a badge.
         // MediaExtractor reports the decoder's output as audio/raw for many lossy files.
         // That is not evidence about the source container and must never grant a badge.
-        // Prefer a real encoded codec/header; otherwise use the file/container MIME.
+        // Header-confirmed PCM uses audio/pcm; extractor audio/raw alone remains untrusted.
         val probedCodec = normalizedAudioMime(codecMimeType)
-            ?.takeUnless { isPcmAudioCodec(it) }
-        val codec = probedCodec ?: normalizedAudioMime(mimeType)
-        val lossless = isLosslessAudioCodec(codec)
+            ?.takeUnless { it == "audio/raw" || isWaveAudioContainer(it) }
+        val codec = probedCodec ?: normalizedAudioMime(mimeType)?.takeUnless(::isPcmAudioCodec)
+        val lossless = probedCodec != null && isLosslessAudioCodec(probedCodec)
         val rate = sampleRate.coerceAtLeast(0)
+        val sourceBits = if (lossless) bits.coerceAtLeast(0) else 0
         val level = when {
-            isDsdAudioCodec(codec) -> AudioQualityLevel.Dsd
-            // Apple-style boundary: 24-bit/48 kHz is lossless, not Hi-Res.
+            probedCodec != null && isDsdAudioCodec(probedCodec) -> AudioQualityLevel.Dsd
+            // Apple Music's ordinary Lossless tier includes up to 24-bit/48 kHz.
+            // A verified source above 48 kHz must not be demoted because Android omitted
+            // its bit-depth field. Unknown depth stays unknown in the information panel.
+            // https://support.apple.com/guide/music/mus90b573cbb/mac
             lossless && rate > 48_000 -> AudioQualityLevel.HiResLossless
             lossless -> AudioQualityLevel.Lossless
             isLossyAudioCodec(codec) -> AudioQualityLevel.Lossy
@@ -65,7 +70,7 @@ val Track.audioQuality: AudioQuality
             formatLabel = audioCodecLabel(codec),
             sampleRate = rate,
             // PCM decoder output precision is not the bit depth of a lossy source.
-            bitsPerSample = if (lossless) bits.coerceAtLeast(0) else 0,
+            bitsPerSample = sourceBits,
             level = level,
             bitrate = bitrate.coerceAtLeast(0L),
         )
@@ -80,10 +85,12 @@ internal fun isPcmAudioCodec(mime: String?): Boolean = when (normalizedAudioMime
 }
 
 internal fun isLosslessAudioCodec(mime: String?): Boolean = when (normalizedAudioMime(mime)) {
-    "audio/flac", "audio/x-flac", "audio/alac", "audio/x-alac", "audio/ape", "audio/x-ape", "audio/monkeys-audio",
-    "audio/wav", "audio/x-wav", "audio/wave" -> true
+    "audio/flac", "audio/x-flac", "audio/alac", "audio/x-alac", "audio/ape", "audio/x-ape", "audio/monkeys-audio" -> true
     else -> isPcmAudioCodec(mime) || isDsdAudioCodec(mime)
 }
+
+private fun isWaveAudioContainer(mime: String?): Boolean =
+    mime in setOf("audio/wav", "audio/x-wav", "audio/wave")
 
 private fun isDsdAudioCodec(mime: String?): Boolean = normalizedAudioMime(mime) in
     setOf("audio/dsd", "audio/dsf", "audio/x-dsf", "audio/dff", "audio/x-dff", "audio/dsdiff")
@@ -125,6 +132,23 @@ internal data class AudioStreamMetadata(
     val bits: Int = 0,
     val bitrate: Long = 0L,
 )
+
+/** Android/FFmpeg ALAC cookies contain a 24-byte ALACSpecificConfig, optionally in an atom. */
+internal fun parseAlacCodecSpecificData(bytes: ByteArray): AudioStreamMetadata? {
+    fun byteAt(offset: Int) = bytes[offset].toInt() and 255
+    fun big32(offset: Int): Long = (0..3).fold(0L) { value, index -> (value shl 8) or byteAt(offset + index).toLong() }
+    val start = when {
+        bytes.size == 24 -> 0
+        bytes.size == 36 && String(bytes, 4, 4, Charsets.US_ASCII) == "alac" && big32(0) == 36L -> 12
+        else -> return null
+    }
+    val frameLength = big32(start)
+    val bits = byteAt(start + 5)
+    val channels = byteAt(start + 9)
+    val rate = big32(start + 20)
+    if (frameLength !in 1..1_048_576L || bits !in 1..32 || channels !in 1..32 || rate !in 1..768_000L) return null
+    return AudioStreamMetadata("audio/alac", rate.toInt(), bits, big32(start + 16))
+}
 
 /** Bounded, pure header parsing. Extensions, decoded PCM and guessed defaults are not evidence. */
 internal fun parseAudioHeader(bytes: ByteArray, length: Int): AudioStreamMetadata? {
@@ -200,15 +224,15 @@ internal fun parseAudioHeader(bytes: ByteArray, length: Int): AudioStreamMetadat
                 if (validBits > 0) bits = validBits
             }
             val codec = when (format) {
-                1, 3 -> "audio/raw" // Integer PCM or uncompressed IEEE float, not arbitrary WAV.
+                1, 3 -> "audio/pcm" // Proven integer PCM / IEEE float, not decoder-output audio/raw.
                 6 -> "audio/g711-alaw"
                 7 -> "audio/g711-mlaw"
                 0x55 -> "audio/mpeg"
                 else -> null
             }
-            if (codec == "audio/raw" && (storageBits !in 1..64 ||
+            if (codec == "audio/pcm" && (storageBits !in 1..64 ||
                     (format == 3 && storageBits != 32 && storageBits != 64))) return null
-            return AudioStreamMetadata(codec, rate, if (codec == "audio/raw") bits else 0)
+            return AudioStreamMetadata(codec, rate, if (codec == "audio/pcm") bits else 0)
         }
         if (matches(offset, "data")) return null
         val next = end + (chunkSize and 1L)

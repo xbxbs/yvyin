@@ -143,6 +143,29 @@ internal class PlaybackQueue<T>(
         context = context.filterNot { it.id == id }
     }
 
+    /**
+     * A deleted file is different from removing one queue occurrence: forget every occurrence,
+     * repeat template and autoplay candidate. Returns whether the active track was removed.
+     * Remaining occurrence IDs/order survive; a removed active track advances without history.
+     */
+    fun removeTrack(key: String): Boolean = removeTracks(setOf(key))
+
+    /** One deletion may have several URI aliases: purge all of them before choosing a next item. */
+    fun removeTracks(keys: Set<String>): Boolean {
+        val removedCurrent = current?.track?.let(keyOf) in keys
+        history = history.filterNot { keyOf(it.track) in keys }
+        manual = manual.filterNot { keyOf(it.track) in keys }
+        context = context.filterNot { keyOf(it.track) in keys }
+        contextCycle = contextCycle.filterNot { keyOf(it.track) in keys }
+        autoplayLibrary = autoplayLibrary.filterNot { keyOf(it) in keys }
+        failedKeys.removeAll(keys)
+        if (removedCurrent) {
+            current = null
+            advance()
+        }
+        return removedCurrent
+    }
+
     private fun forgetContextItem(item: Entry<T>) {
         val position = item.contextPosition ?: return
         contextCycle = contextCycle.filterNot { it.position == position }

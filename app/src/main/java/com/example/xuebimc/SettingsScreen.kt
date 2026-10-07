@@ -8,6 +8,7 @@ import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.ExperimentalFoundationApi
+import androidx.compose.foundation.LocalIndication
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
@@ -16,6 +17,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -51,6 +53,7 @@ fun SettingsScreen(
     isActive: Boolean = true,
     onOverlayVisibilityChange: (Boolean) -> Unit = {},
     onDeveloperOptions: () -> Unit = {},
+    onDownloads: () -> Unit = {},
 ) {
     val values by preferences.values.collectAsState()
     val context = LocalContext.current
@@ -58,13 +61,16 @@ fun SettingsScreen(
     var menu by remember { mutableStateOf<String?>(null) }
     var pickerPending by remember { mutableStateOf(false) }
     var folderError by remember { mutableStateOf<String?>(null) }
+    var licensesVisible by rememberSaveable { mutableStateOf(false) }
     val pathAnchor = rememberMenuAnchor()
     val qualityAnchor = rememberMenuAnchor()
+    val downloadQualityAnchor = rememberMenuAnchor()
     val version = remember(context) {
         runCatching { context.packageManager.getPackageInfo(context.packageName, 0).versionName }.getOrNull().orEmpty()
     }
     val source = sources.firstOrNull { it.id == currentSourceId }
     val requestedQuality = OnlinePlaybackQuality.fromLevel(values.onlineQuality) ?: OnlinePlaybackQuality.Standard
+    val downloadQuality = OnlinePlaybackQuality.fromLevel(values.downloadQuality) ?: OnlinePlaybackQuality.Standard
     val folderPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocumentTree()) { uri ->
         if (uri != null) scope.launch {
             try {
@@ -76,8 +82,15 @@ fun SettingsScreen(
         }
     }
     LaunchedEffect(isActive) { if (!isActive) { menu = null; pickerPending = false } }
+    if (licensesVisible) {
+        LicensesScreen(bottomInset = bottomInset, isActive = isActive, onBack = { licensesVisible = false })
+        return
+    }
     BackHandler(isActive && menu == null, onBack = onBack)
     CupertinoTheme(colorScheme = darkColorScheme()) {
+        // Cupertino alpha04 replaces the outer LocalIndication with a legacy Indication.
+        // Supply our node-based feedback INSIDE the theme for clickable/combinedClickable/switches.
+        CompositionLocalProvider(LocalIndication provides PressFadeIndication) {
         LazyColumn(Modifier.fillMaxSize().background(Color.Black).statusBarsPadding(),
             contentPadding = PaddingValues(start = 18.dp, end = 18.dp, top = 8.dp, bottom = bottomInset + 24.dp)) {
             item(key = "settings:title") {
@@ -87,8 +100,21 @@ fun SettingsScreen(
             }
             item(key = "settings:preferences") {
                 Column(Modifier.fillMaxWidth().clip(RoundedCornerShape(14.dp)).background(Color(0xFF1C1C1E))) {
+                    PreferenceRow("下载管理", "查看进度与下载记录", onClick = onDownloads)
+                    PreferenceDivider()
                     PreferenceRow("下载路径", values.downloadFolderName, pathAnchor.first) { pathAnchor.second(); menu = "folder" }
                     PreferenceDivider()
+                    PreferenceRow("下载音质", downloadQuality.label, downloadQualityAnchor.first) {
+                        downloadQualityAnchor.second(); menu = "download-quality"
+                    }
+                    PreferenceDivider()
+                    PreferenceSwitch("内嵌封面", values.downloadEmbedCover, preferences::setDownloadEmbedCover)
+                    PreferenceDivider()
+                    PreferenceSwitch("内嵌歌词", values.downloadEmbedLyrics, preferences::setDownloadEmbedLyrics)
+                }
+                PreferenceText("封面和歌词直接写入音频，不生成伴生文件。缺少内容或格式不支持时，会在下载记录中说明。",
+                    Modifier.padding(horizontal = 16.dp, vertical = 12.dp), color = SettingsSecondary, size = 13)
+                Column(Modifier.fillMaxWidth().padding(top = 12.dp).clip(RoundedCornerShape(14.dp)).background(Color(0xFF1C1C1E))) {
                     PreferenceRow("在线播放音质", requestedQuality.label, qualityAnchor.first) { qualityAnchor.second(); menu = "quality" }
                     PreferenceDivider()
                     Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 8.dp),
@@ -106,20 +132,17 @@ fun SettingsScreen(
                             colors = CupertinoSwitchDefaults.colors(checkedTrackColor = LibraryAccent),
                             modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "液态玻璃" })
                     }
-                    PreferenceDivider()
-                    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
-                        PreferenceText("下载附加文件", Modifier.weight(1f))
-                        CupertinoSwitch(checked = values.downloadCompanionFiles,
-                            onCheckedChange = preferences::setDownloadCompanionFiles,
-                            colors = CupertinoSwitchDefaults.colors(checkedTrackColor = LibraryAccent),
-                            modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = "下载附加文件" })
-                    }
                 }
             }
             folderError?.let { error -> item(key = "settings:error") {
                 PreferenceText(error, Modifier.padding(top = 12.dp), color = SettingsSecondary, size = 13)
             } }
+            item(key = "settings:licenses") {
+                Column(Modifier.fillMaxWidth().padding(top = 24.dp).clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF1C1C1E))) {
+                    PreferenceRow("开源许可", "查看组件与字体的许可文本", onClick = { licensesVisible = true })
+                }
+            }
             item(key = "settings:version") {
                 Box(Modifier.fillMaxWidth().padding(top = 26.dp).heightIn(min = 44.dp)
                     .combinedClickable(onClick = {}, onLongClick = onDeveloperOptions, onLongClickLabel = "打开开发者选项"),
@@ -139,7 +162,11 @@ fun SettingsScreen(
                     folderPicker.launch(values.downloadTreeUri?.let(Uri::parse))
                 }
             },
-            header = { PreferenceText(if (shownMenu == "folder") "下载路径" else "在线播放音质", Modifier.padding(16.dp)) },
+            header = { PreferenceText(when (shownMenu) {
+                "folder" -> "下载路径"
+                "download-quality" -> "默认下载音质"
+                else -> "在线播放音质"
+            }, Modifier.padding(16.dp)) },
         ) {
             if (shownMenu == "folder") {
                 SheetActionRow("选择文件夹", PlayerIconType.Download) { pickerPending = true; menu = null }
@@ -149,16 +176,33 @@ fun SettingsScreen(
                     folderError = null; menu = null
                 }
             } else {
+                val forDownload = shownMenu == "download-quality"
+                val selectedQuality = if (forDownload) downloadQuality else requestedQuality
                 OnlinePlaybackQuality.entries.forEachIndexed { index, quality ->
                     if (index > 0) SheetActionDivider()
-                    val supported = source?.enabled == true && source.supportsPlayback && quality in source.supportedQualities
-                    if (supported) SheetActionRow(quality.label, selected = quality == requestedQuality) {
-                        preferences.setOnlineQuality(quality.level); menu = null
+                    val supported = if (forDownload) sources.any { it.enabled && it.supportsDownload && quality in it.supportedQualities }
+                        else source?.enabled == true && source.supportsPlayback && quality in source.supportedQualities
+                    if (supported) SheetActionRow(quality.label, selected = quality == selectedQuality) {
+                        if (forDownload) preferences.setDownloadQuality(quality.level) else preferences.setOnlineQuality(quality.level)
+                        menu = null
                     } else PreferenceText("${quality.label} · 当前音源不支持", Modifier.fillMaxWidth().padding(16.dp), SettingsSecondary, 15)
                 }
-                PreferenceText("${source?.name ?: "当前音源"} · 下一次在线播放生效", Modifier.padding(16.dp), SettingsSecondary, 12)
+                PreferenceText(if (forDownload) "每次下载前仍可选择；不支持的音质不会自动降级。"
+                    else "${source?.name ?: "当前音源"} · 下一次在线播放生效", Modifier.padding(16.dp), SettingsSecondary, 12)
             }
         }
+        }
+    }
+}
+
+@Composable
+private fun PreferenceSwitch(label: String, checked: Boolean, onChange: (Boolean) -> Unit) {
+    Row(Modifier.fillMaxWidth().heightIn(min = 60.dp).padding(horizontal = 16.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+        PreferenceText(label, Modifier.weight(1f))
+        CupertinoSwitch(checked = checked, onCheckedChange = onChange,
+            colors = CupertinoSwitchDefaults.colors(checkedTrackColor = LibraryAccent),
+            modifier = Modifier.heightIn(min = 48.dp).semantics { contentDescription = label })
     }
 }
 

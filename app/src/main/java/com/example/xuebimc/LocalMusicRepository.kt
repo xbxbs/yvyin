@@ -15,6 +15,7 @@ import android.os.CancellationSignal
 import android.provider.DocumentsContract
 import android.provider.MediaStore
 import android.provider.OpenableColumns
+import android.util.LruCache
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileNotFoundException
@@ -22,6 +23,8 @@ import java.io.IOException
 import java.io.InputStream
 import java.net.URL
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 import java.util.concurrent.atomic.AtomicReference
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
@@ -45,7 +48,29 @@ class LocalMusicRepository(context: Context) {
     private val appContext = context.applicationContext
     private val resolver = appContext.contentResolver
     private val lyricLinks by lazy { appContext.getSharedPreferences("local_music_lyrics", Context.MODE_PRIVATE) }
+    private val revisionSequence = AtomicLong(0L)
+    private val forcedFileRevisions = ConcurrentHashMap<String, Long>()
+    // Only explicitly edited files need an authoritative tag read beyond the MediaStore index.
+    private val editedDetails = LruCache<String, Track>(32)
+    @Volatile private var forcedLibraryRevision = 0L
 
+    /** Force a tag/artwork re-read after an editor returns, including same-size/same-second edits. */
+    fun invalidateMetadata(uri: Uri? = null) {
+        val revision = revisionSequence.incrementAndGet()
+        if (uri == null) {
+            forcedLibraryRevision = revision
+            forcedFileRevisions.clear()
+            editedDetails.evictAll()
+        } else {
+            forcedFileRevisions[uri.toString()] = revision
+            editedDetails.remove(uri.toString())
+        }
+    }
+
+    private fun metadataRevision(uri: Uri, modified: Long, size: Long, generation: Long = 0L): String =
+        "$modified:$size:$generation:$forcedLibraryRevision:${forcedFileRevisions[uri.toString()] ?: 0L}"
+
+    @Suppress("DEPRECATION")
     suspend fun scan(): List<Track> = withContext(Dispatchers.IO) {
         val collection = MediaStore.Audio.Media.EXTERNAL_CONTENT_URI
         val projection = mutableListOf(
@@ -61,8 +86,12 @@ class LocalMusicRepository(context: Context) {
         )
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) projection += MediaStore.MediaColumns.RELATIVE_PATH
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) projection += MediaStore.Audio.Media.GENRE
+        projection += MediaStore.MediaColumns.DATE_ADDED
+        projection += MediaStore.MediaColumns.DATA
+        projection += MediaStore.MediaColumns.DATE_MODIFIED
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) projection += MediaStore.MediaColumns.GENERATION_MODIFIED
         val active = currentCoroutineContext()
-        query(
+        val indexed = query(
             collection,
             projection.toTypedArray(),
             "(${MediaStore.Audio.Media.IS_MUSIC} != 0 OR ${MediaStore.Audio.Media.DURATION} > 0)",
@@ -74,10 +103,12 @@ class LocalMusicRepository(context: Context) {
                     active.ensureActive()
                     val id = cursor.numberAt(columns[0])
                     val name = cursor.stringAt(columns[6]).orEmpty()
+                    val uri = ContentUris.withAppendedId(collection, id)
+                    val size = cursor.numberAt(columns[8]).coerceAtLeast(0)
                     add(
                         Track(
                             id = id,
-                            uri = ContentUris.withAppendedId(collection, id),
+                            uri = uri,
                             title = cursor.stringAt(columns[1]).known() ?: titleFrom(name),
                             artist = cursor.stringAt(columns[2]).known() ?: UNKNOWN,
                             album = cursor.stringAt(columns[3]).known() ?: UNKNOWN,
@@ -85,24 +116,168 @@ class LocalMusicRepository(context: Context) {
                             albumId = cursor.numberAt(columns[5]).coerceAtLeast(0),
                             displayName = name,
                             mimeType = cursor.stringAt(columns[7]).known(),
-                            sizeBytes = cursor.numberAt(columns[8]).coerceAtLeast(0),
-                            relativePath = columns.getOrNull(9)?.let { cursor.stringAt(it) },
+                            sizeBytes = size,
+                            relativePath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) cursor.text(MediaStore.MediaColumns.RELATIVE_PATH) else null,
+                            folderPath = localFileParent(cursor.text(MediaStore.MediaColumns.DATA)),
+                            addedAtMs = mediaAddedAtMs(cursor.numberAt(cursor.getColumnIndex(MediaStore.MediaColumns.DATE_ADDED))),
                             genre = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) cursor.text(MediaStore.Audio.Media.GENRE).known() else null,
+                            metadataRevision = metadataRevision(
+                                uri,
+                                cursor.numberAt(cursor.getColumnIndex(MediaStore.MediaColumns.DATE_MODIFIED)),
+                                size,
+                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                                    cursor.numberAt(cursor.getColumnIndex(MediaStore.MediaColumns.GENERATION_MODIFIED))
+                                } else 0L,
+                            ),
                         ),
                     )
                 }
             }
         } ?: emptyList()
+        indexed.map { track ->
+            active.ensureActive()
+            if (!forcedFileRevisions.containsKey(track.uri.toString())) track else {
+                // Some tag editors do not update MediaStore. Read just the edited target,
+                // including removed tags/lyrics, and retain that result for this exact revision.
+                val cached = editedDetails.get(track.uri.toString())
+                    ?.takeIf { it.metadataRevision == track.metadataRevision }
+                (cached ?: loadDetails(track).also { editedDetails.put(track.uri.toString(), it) })
+                    .copy(
+                        albumId = track.albumId,
+                        displayName = track.displayName,
+                        relativePath = track.relativePath,
+                        folderPath = track.folderPath,
+                        addedAtMs = track.addedAtMs,
+                    )
+            }
+        }
     }
 
+    /** Merge SAF imports with MediaStore by verified file identity, never by song/tag similarity. */
+    suspend fun mergeLibrary(scanned: List<Track>, imported: List<Track>): List<Track> = withContext(Dispatchers.IO) {
+        val merged = scanned.associateByTo(linkedMapOf()) { it.stableKey }
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
+            imported.forEach { track ->
+                merged[track.stableKey] = merged[track.stableKey]?.withImportFacts(track) ?: track
+            }
+            return@withContext merged.values.toList()
+        }
+        // Index only IDs in memory. Query a scanned row only when an imported file might match it.
+        val scannedById = scanned.filter { !it.isOnline && it.uri.authority == MediaStore.AUTHORITY }
+            .mapNotNull { track -> runCatching { ContentUris.parseId(track.uri) }.getOrNull()?.let { it to track } }
+            .groupBy({ it.first }, { it.second })
+        val identities = mutableMapOf<String, Pair<String, Long>?>()
+        val readable = mutableMapOf<String, Boolean>()
+        val verified = mutableMapOf<Pair<String, Long>, Track>()
+        suspend fun identity(uri: Uri): Pair<String, Long>? {
+            val key = uri.toString()
+            if (identities.containsKey(key)) return identities[key]
+            val result = mediaFileIdentity(uri)
+            identities[key] = result
+            return result
+        }
+        suspend fun canRead(track: Track): Boolean {
+            val key = track.uri.toString()
+            readable[key]?.let { return it }
+            val result = optional { resolver.openFileDescriptor(track.uri, "r")?.use { true } } == true
+            readable[key] = result
+            return result
+        }
+        for (track in imported) {
+            currentCoroutineContext().ensureActive()
+            val sameKey = merged[track.stableKey]
+            if (sameKey != null) {
+                merged[track.stableKey] = sameKey.withImportFacts(track)
+                continue
+            }
+            val mediaUri = if (track.isOnline || track.uri.scheme != "content") null else optional {
+                if (track.uri.authority == MediaStore.AUTHORITY) track.uri
+                else MediaStore.getMediaUri(appContext, track.uri)
+            }
+            val fileIdentity = mediaUri?.let { identity(it) }
+            val previous = fileIdentity?.let { key ->
+                verified[key] ?: scannedById[key.second]?.firstOrNull { candidate ->
+                    merged.containsKey(candidate.stableKey) && identity(candidate.uri) == key
+                }?.let { merged[it.stableKey] }
+            }
+            when {
+                previous != null && canRead(previous) -> {
+                    val enriched = previous.withImportFacts(track)
+                    merged[previous.stableKey] = enriched
+                    verified[checkNotNull(fileIdentity)] = enriched
+                }
+                previous != null -> {
+                    // A SAF grant does not grant MediaStore read permission. Keep the readable
+                    // document URI if the matching scanned row cannot actually be opened.
+                    merged.remove(previous.stableKey)
+                    val enriched = track.withImportFacts(previous)
+                    merged[track.stableKey] = enriched
+                    verified[checkNotNull(fileIdentity)] = enriched
+                }
+                else -> {
+                    merged[track.stableKey] = track
+                    if (fileIdentity != null) verified[fileIdentity] = track
+                }
+            }
+        }
+        merged.values.toList()
+    }
+
+    /** Resolve aliases before deletion, while provider mappings still exist. Never match tags. */
+    suspend fun aliasesFor(track: Track, importedUris: Set<String>): Set<String> = withContext(Dispatchers.IO) {
+        val aliases = linkedSetOf(track.uri.toString())
+        val targetMediaUri = mappedMediaUri(track.uri) ?: return@withContext aliases
+        val targetIdentity = mediaFileIdentity(targetMediaUri)
+        for (saved in importedUris) {
+            currentCoroutineContext().ensureActive()
+            if (saved in aliases) continue
+            val uri = optional { Uri.parse(saved) } ?: continue
+            val candidateMediaUri = mappedMediaUri(uri) ?: continue
+            if (candidateMediaUri == targetMediaUri ||
+                (targetIdentity != null && mediaFileIdentity(candidateMediaUri) == targetIdentity)
+            ) aliases += saved
+        }
+        aliases
+    }
+
+    private suspend fun mappedMediaUri(uri: Uri): Uri? = when {
+        uri.scheme != "content" -> null
+        uri.authority == MediaStore.AUTHORITY -> uri
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q -> optional { MediaStore.getMediaUri(appContext, uri) }
+        else -> null
+    }
+
+    private suspend fun mediaFileIdentity(uri: Uri): Pair<String, Long>? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q || uri.authority != MediaStore.AUTHORITY) return null
+        return optional {
+            query(uri, arrayOf(MediaStore.MediaColumns._ID, MediaStore.MediaColumns.VOLUME_NAME)) { cursor ->
+                if (!cursor.moveToFirst()) return@query null
+                val volume = cursor.text(MediaStore.MediaColumns.VOLUME_NAME)?.takeIf { it.isNotBlank() }
+                    ?: return@query null
+                val id = cursor.numberAt(cursor.getColumnIndex(MediaStore.MediaColumns._ID))
+                if (id > 0L) volume to id else null
+            }
+        }
+    }
+
+    private fun Track.withImportFacts(other: Track): Track = copy(
+        // A later, explicitly recorded import is real evidence, unlike an ID or edit time.
+        addedAtMs = maxOf(addedAtMs, other.addedAtMs).coerceAtLeast(0L),
+        relativePath = relativePath?.takeIf { it.isNotBlank() } ?: other.relativePath,
+        folderPath = folderPath?.takeIf { it.isNotBlank() } ?: other.folderPath,
+    )
+
     suspend fun loadDetails(track: Track): Track = withContext(Dispatchers.IO) {
-        val detailed = if (track.isOnline) track else metadata(track)
+        val detailed = if (track.isOnline) track else metadata(
+            track, authoritativeTags = forcedFileRevisions.containsKey(track.uri.toString()),
+        )
         val attached = lyricLinks.getString(track.stableKey, null)?.let { saved ->
             optional { lyricsAt(Uri.parse(saved), detailed.durationMs) }
         }
         // Lyrics inside the audio file first, then a same-named .ttml / .lrc beside it.
         val lyrics = attached ?: if (track.isOnline) null else embeddedLyrics(detailed) ?: siblingLyrics(detailed)
-        detailed.copy(lines = lyrics ?: track.lines)
+        // An editor can remove lyrics as well as add them. Never resurrect cached local tags.
+        detailed.copy(lines = lyrics ?: if (track.isOnline) track.lines else emptyList())
     }
 
     /** Lyrics stored in the audio tags (USLT / Vorbis LYRICS / MP4 ©lyr). */
@@ -148,7 +323,13 @@ class LocalMusicRepository(context: Context) {
     /** Only artwork bytes, in memory; no playback headers, cookies, disk cache or automatic redirects. */
     private suspend fun downloadArtwork(uri: Uri): ByteArray? = RemoteArtworkHttp.download(uri.toString())
 
-    suspend fun importAudio(uri: Uri): Track = withContext(Dispatchers.IO) {
+    suspend fun importAudio(uri: Uri, addedAtMs: Long = 0L): Track = withContext(Dispatchers.IO) {
+        currentCoroutineContext().ensureActive()
+        // Missing/revoked SAF records must not turn into playable-looking "unknown" tracks.
+        // Opening is read-only and releases its descriptor immediately; no permission is added.
+        resolver.openFileDescriptor(uri, "r")?.use { }
+            ?: throw FileNotFoundException("歌曲文件不存在或无法读取")
+        currentCoroutineContext().ensureActive()
         val info = optional {
             query(uri, arrayOf(OpenableColumns.DISPLAY_NAME, OpenableColumns.SIZE)) { cursor ->
                 if (cursor.moveToFirst()) {
@@ -158,7 +339,20 @@ class LocalMusicRepository(context: Context) {
             }
         }
         val name = info?.first.orEmpty()
+        val size = info?.second ?: 0L
+        val modified = optional {
+            when {
+                uri.scheme == "file" -> uri.path?.let { File(it).lastModified() }
+                DocumentsContract.isDocumentUri(appContext, uri) -> query(
+                    uri, arrayOf(DocumentsContract.Document.COLUMN_LAST_MODIFIED),
+                ) { cursor ->
+                    if (cursor.moveToFirst()) cursor.numberAt(0) else 0L
+                }
+                else -> 0L
+            }
+        } ?: 0L
         val mediaId = if (uri.authority == MediaStore.AUTHORITY) optional { ContentUris.parseId(uri) } else null
+        val facts = importFileFacts(uri)
         metadata(
             Track(
                 id = mediaId?.takeIf { it >= 0 } ?: importedId(uri),
@@ -169,9 +363,42 @@ class LocalMusicRepository(context: Context) {
                 durationMs = 0,
                 displayName = name,
                 mimeType = optional { resolver.getType(uri) }?.known(),
-                sizeBytes = info?.second ?: 0,
+                sizeBytes = size,
+                relativePath = facts.relativePath,
+                folderPath = facts.folderPath,
+                addedAtMs = maxOf(addedAtMs, facts.addedAtMs).coerceAtLeast(0L),
+                metadataRevision = metadataRevision(uri, modified, size),
             ),
         )
+    }
+
+    @Suppress("DEPRECATION")
+    private suspend fun importFileFacts(uri: Uri): ImportFileFacts {
+        val columns = mutableListOf(MediaStore.MediaColumns.DATA)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) columns += MediaStore.MediaColumns.RELATIVE_PATH
+        if (uri.authority == MediaStore.AUTHORITY) columns += MediaStore.MediaColumns.DATE_ADDED
+        val queried = if (uri.scheme == "content") optional {
+            query(uri, columns.toTypedArray()) { cursor ->
+                if (!cursor.moveToFirst()) null else ImportFileFacts(
+                    relativePath = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        cursor.text(MediaStore.MediaColumns.RELATIVE_PATH)?.takeIf { it.isNotBlank() }
+                    } else null,
+                    folderPath = localFileParent(cursor.text(MediaStore.MediaColumns.DATA)),
+                    addedAtMs = if (uri.authority == MediaStore.AUTHORITY) {
+                        mediaAddedAtMs(cursor.numberAt(cursor.getColumnIndex(MediaStore.MediaColumns.DATE_ADDED)))
+                    } else 0L,
+                )
+            }
+        } else null
+        val documentParent = if (uri.authority == "com.android.externalstorage.documents") optional {
+            // getDocumentId also handles /tree/.../document/... while an opaque tree root
+            // without an audio document is not enough evidence to infer this file's parent.
+            externalStorageDocumentParent(uri.authority, DocumentsContract.getDocumentId(uri))
+        } else null
+        return (queried ?: ImportFileFacts()).let { facts ->
+            facts.copy(folderPath = facts.folderPath
+                ?: if (uri.scheme == "file") localFileParent(uri.path) else documentParent)
+        }
     }
 
     suspend fun attachLyrics(track: Track, uri: Uri): Track = withContext(Dispatchers.IO) {
@@ -181,15 +408,19 @@ class LocalMusicRepository(context: Context) {
         track.copy(lines = lines)
     }
 
-    private suspend fun metadata(track: Track): Track = withContext(Dispatchers.IO) {
+    private suspend fun metadata(track: Track, authoritativeTags: Boolean = false): Track = withContext(Dispatchers.IO) {
         if (track.isOnline || track.uri.scheme !in listOf("content", "file")) return@withContext track
+        // Probe each local revision from scratch; an old codec or lyric result is not new evidence.
+        val base = track.copy(codecMimeType = null, sampleRate = 0, bits = 0, bitrate = 0L, lines = emptyList())
         val detailed = retrieve(track.uri) { retriever ->
             fun value(key: Int) = retriever.extractMetadata(key).known()
-            track.copy(
-                title = value(MediaMetadataRetriever.METADATA_KEY_TITLE) ?: track.title,
-                artist = value(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: track.artist,
-                album = value(MediaMetadataRetriever.METADATA_KEY_ALBUM) ?: track.album,
-                genre = value(MediaMetadataRetriever.METADATA_KEY_GENRE) ?: track.genre,
+            base.copy(
+                title = value(MediaMetadataRetriever.METADATA_KEY_TITLE) ?: if (authoritativeTags) {
+                    titleFrom(track.displayName).takeUnless { it == UNKNOWN } ?: track.title
+                } else track.title,
+                artist = value(MediaMetadataRetriever.METADATA_KEY_ARTIST) ?: if (authoritativeTags) UNKNOWN else track.artist,
+                album = value(MediaMetadataRetriever.METADATA_KEY_ALBUM) ?: if (authoritativeTags) UNKNOWN else track.album,
+                genre = value(MediaMetadataRetriever.METADATA_KEY_GENRE) ?: if (authoritativeTags) null else track.genre,
                 durationMs = value(MediaMetadataRetriever.METADATA_KEY_DURATION)?.toLongOrNull()
                     ?.takeIf { it > 0 } ?: track.durationMs,
                 // Some vendor retrievers report the decoded PCM output (audio/raw) here.
@@ -197,22 +428,24 @@ class LocalMusicRepository(context: Context) {
                 mimeType = value(MediaMetadataRetriever.METADATA_KEY_MIMETYPE)
                     ?.takeUnless { isPcmAudioCodec(it) } ?: track.mimeType,
                 bitrate = value(MediaMetadataRetriever.METADATA_KEY_BITRATE)?.toLongOrNull()
-                    ?.takeIf { it > 0L } ?: track.bitrate,
+                    ?.takeIf { it > 0L } ?: 0L,
                 sampleRate = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     value(MediaMetadataRetriever.METADATA_KEY_SAMPLERATE)?.toIntOrNull()
-                        ?.takeIf { it > 0 } ?: track.sampleRate
-                } else track.sampleRate,
+                        ?.takeIf { it > 0 } ?: 0
+                } else 0,
                 bits = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
                     value(MediaMetadataRetriever.METADATA_KEY_BITS_PER_SAMPLE)?.toIntOrNull()
-                        ?.takeIf { it > 0 } ?: track.bits
-                } else track.bits,
+                        ?.takeIf { it > 0 } ?: 0
+                } else 0,
             )
-        } ?: track
+        } ?: base
         // Either probe can succeed independently when a vendor retriever/extractor cannot.
         val stream = audioStreamMetadata(track.uri)
         val header = audioHeaderMetadata(track.uri)
         val result = detailed.copy(
-            codecMimeType = header?.codecMimeType ?: stream?.codecMimeType ?: detailed.codecMimeType,
+            // Only a PCM container header proves the source is PCM. Some vendor extractors
+            // expose audio/raw for decoded MP3/AAC, even when the filename ends in .flac.
+            codecMimeType = header?.codecMimeType ?: stream?.codecMimeType?.takeUnless(::isPcmAudioCodec),
             sampleRate = header?.sampleRate?.takeIf { it > 0 }
                 ?: stream?.sampleRate?.takeIf { it > 0 } ?: detailed.sampleRate,
             bits = header?.bits?.takeIf { it > 0 }
@@ -234,6 +467,15 @@ class LocalMusicRepository(context: Context) {
                 fun positiveInt(key: String): Int = try {
                     if (format.containsKey(key)) format.getInteger(key).coerceAtLeast(0) else 0
                 } catch (_: Exception) { 0 }
+                val alac = if (codec == "audio/alac" || codec == "audio/x-alac") runCatching {
+                    format.getByteBuffer("csd-0")?.duplicate()?.let { buffer ->
+                        if (buffer.remaining() !in setOf(24, 36)) null else {
+                            val config = ByteArray(buffer.remaining())
+                            buffer.get(config)
+                            parseAlacCodecSpecificData(config)
+                        }
+                    }
+                }.getOrNull() else null
                 // pcm-encoding on AAC/MP3 can describe decoder output; only trust it for PCM files.
                 val pcmBits = if (isPcmAudioCodec(codec)) when (positiveInt(MediaFormat.KEY_PCM_ENCODING)) {
                     AudioFormat.ENCODING_PCM_8BIT -> 8
@@ -244,11 +486,11 @@ class LocalMusicRepository(context: Context) {
                 } else 0
                 return@optional AudioStreamMetadata(
                     codecMimeType = codec,
-                    sampleRate = positiveInt(MediaFormat.KEY_SAMPLE_RATE),
-                    bits = if (isLosslessAudioCodec(codec)) {
+                    sampleRate = alac?.sampleRate ?: positiveInt(MediaFormat.KEY_SAMPLE_RATE),
+                    bits = alac?.bits ?: if (isLosslessAudioCodec(codec)) {
                         positiveInt("bits-per-sample").takeIf { it > 0 } ?: pcmBits
                     } else 0,
-                    bitrate = positiveInt(MediaFormat.KEY_BIT_RATE).toLong(),
+                    bitrate = positiveInt(MediaFormat.KEY_BIT_RATE).toLong().takeIf { it > 0L } ?: alac?.bitrate ?: 0L,
                 )
             }
             null
@@ -258,29 +500,9 @@ class LocalMusicRepository(context: Context) {
     }
 
     private suspend fun audioHeaderMetadata(uri: Uri): AudioStreamMetadata? = optional {
+        val jobContext = currentCoroutineContext()
         resolver.openInputStream(uri)?.use { input ->
-            // Known headers are bounded; ordinary formats stop after a 16-byte signature.
-            val bytes = ByteArray(64 * 1024)
-            var count = 0
-            var limit = 16
-            while (count < limit) {
-                currentCoroutineContext().ensureActive()
-                val read = input.read(bytes, count, limit - count)
-                if (read <= 0) break
-                count += read
-                if (count == 16 && limit == 16) {
-                    val magic = String(bytes, 0, 4, Charsets.US_ASCII)
-                    limit = when {
-                        magic == "fLaC" -> 42
-                        magic == "DSD " || magic == "MAC " -> 80
-                        magic == "FRM8" && String(bytes, 12, 4, Charsets.US_ASCII) == "DSD " -> 16
-                        (magic == "RIFF" || magic == "RF64") &&
-                            String(bytes, 8, 4, Charsets.US_ASCII) == "WAVE" -> bytes.size
-                        else -> return@use null
-                    }
-                }
-            }
-            parseAudioHeader(bytes, count)
+            readAudioHeader(input) { jobContext.ensureActive() }
         }
     }
 
@@ -516,6 +738,11 @@ class LocalMusicRepository(context: Context) {
     private fun Cursor.numberAt(index: Int): Long = if (index < 0 || isNull(index)) 0 else getLong(index)
     private fun Cursor.text(column: String): String? = stringAt(getColumnIndex(column))
     private data class Location(val name: String, val path: String?, val relativePath: String?)
+    private data class ImportFileFacts(
+        val relativePath: String? = null,
+        val folderPath: String? = null,
+        val addedAtMs: Long = 0L,
+    )
 
     private companion object {
         const val UNKNOWN = "未知"

@@ -1,5 +1,69 @@
 # 进行中（会话常被重启，开工先读这里；用户要求：每一项都不能漏）
 
+## 最新交付：冻结播放页终态，追加容器转场与逐档下载预检
+
+- 本次以PLAYER_UI_LOCK.md为硬边界；七个核心播放页/歌词/背景/手势文件与本轮修改前哈希一致。转场仅修改外层承接与mini注册，不改PlayerScreen终态。
+- PlayerSurfaceTransition记录整张mini surface，按同一p插值边界/裁剪/圆角，p=1恒等；无源时原位淡入，移除无关底部背景整屏上移。SharedArtwork只调整新根坐标转换，封面既有绘制仍复用。
+- 下载弹层由固定四标签改为来源实际支持档位的逐项预检，展示格式/大小/失败；选中后确认，沿用prepared URL。关闭/换曲取消任务，最多2并发，不虚构蝰蛇/Master档位。
+- 下载预检离线专项已运行PASS；assembleRelease --offline通过（12m54s），v2签名和zipalign通过。真机动画/源服务未验收。
+- Lyrico1.6.0-ad9c83f字节码确认EDIT_TAG直接到EditMetadataDestination，冷/热启动均处理；当前只研究，代码未改。结论与授权边界见LYRICO_INTEGRATION.md。
+- 本轮文件名“余音-v1.6-播放转场与下载音质.apk”及对应source.tar.gz。用户要求上传 https://github.com/xbxbs/yvyin ，仅提交源码/文档/许可，不上传私钥、令牌、用户样本或临时反编译文件。
+
+## 最新边界：播放页冻结，只有明确授权的转场例外
+
+- 用户要求写下“播放页千万不能动”，已新增PLAYER_UI_LOCK.md和项目AGENTS.md；禁止修改其静态布局、字体、背景、歌词等，也禁止通过共享主题间接改变。
+- 随后用户明确点名展开动画：只飞封面、另一个背景自底升起。仅放行迷你↔全屏容器转场衔接，终态仍冻结。
+- Lyrico APK入口进行只读研究；用户尚未要求实现，不改MetadataEditor。完成修改后上传用户指定GitHub仓库，令牌不进入仓库/文档/remote。
+
+## 当前窄修：音质标识照Apple，不混写SQ/HR
+
+- 用户明确拒绝“SQ · 无损音频”的重复混写。本次只把共享badgeLabel改成“无损”/“高解析度无损”；播放页与信息面板同时使用，DSD仍独立。
+- 不再修改判定阈值、文件读取、布局或底栏。同步标签断言；低风险文案改动不重复运行全量/专项测试，只做增量发布打包与签名核对。
+- 本次产物名：余音-v1.6-苹果音质标识.apk，源码同名前缀-source.tar.gz；保留旧产物和版本1.6/code7。
+
+## 当前重做：以用户截图否定旧UI，核对Apple音质规则
+
+- 用户明确否定上轮资料库大空白/六行导航、嵌套灰圆菜单和液态底栏；本轮不是将旧界面认作验收通过。
+- 已取得 KernelSU 实际 manager 源码并核对 FloatingBottomBar：64dp基座/56dp选中透镜、轻blur/vibrancy/lens、分层标签采样和跟手指示器。本工程以现有Kyant1.0 API实现，取消常驻色散，捕获背景先画不透明基底，未导入KernelSU的root功能或GPL辅助代码。
+- 首页标题+更多同排、初始顶部14dp、搜索48dp触摸区、两列三行平面入口（大字/窄屏回退一列）、最近封面首屏前移。菜单单surface/48dp动作、详情独立居中344dp，参数不再挤到98dp标签旁；切换弹层重置其专属滚动状态。播放器本体布局未变。
+- 音质依据已查 Apple 官方 Music用户指南，见 AUDIO_QUALITY.md。主代理此前声称“24bit/44.1一定HR”错误，已向用户纠正：该格式属Apple普通无损；真正bug是采样率已>48k却因位深未知被降SQ。已移除该多余位深条件，并补FLAC ID3前缀及ALAC csd位深读取。没有把所有文件统一改标HR。
+- tools/LocalAudioQualityCheck.kt已用生产代码离线运行通过：Apple24/44.1、24/48、>48k分界，未知位深高采样、FLAC+ID3、ALAC、坏头、有损/假后缀。未读取用户整库逐首对比，也不拿测试文件冒充其真实歌曲。
+- 采用apple-design/impeccable的层次、原生触摸和可中断动画约束；没有可用真机渲染证据，用户旧截图仅是反例。设计记录见design/UI_REVISION.md，发布构建/归档完成后更新RELEASE.md。
+- 本轮assembleRelease --offline通过（2m15s），音质专项三组PASS，v2签名/zipalign通过且与上一轮交付同签名。正式产物改为“余音-v1.6-界面重做与音质校正.apk”和对应source.tar.gz，不覆盖旧包。
+- 独立审查两次429失败；源码核对及文档JSON检查完成，视觉审查按缺少新原生截图记录recapture，不能称用户已验收。按用户要求仍交付已构建包供其手机验证；无卸载或清数据操作。
+
+## 最新接续：用户要求补完再打包
+
+- 继续补完 TODO 中确定的历史缺项，不发送中途编译包。版本仍 1.6 / code7。
+- 播放页只补交互：暂停封面84%缩放与阴影、共享封面尺寸连续性、收藏触感/单次弹跳、队列模式小标；原静态布局、字号、歌词曲线保持。
+- 歌词长按系统分享本句/译文；设置新增真实许可列表/阅读页；保留之前 Cupertino 兼容修复和默认内嵌下载选项。
+- 资料库改用真实 DATE_ADDED/导入/下载登记时间，未知时间不伪造；补可证明的路径。主页分类去多余卡片包裹、下载管理直达、最近添加响应式封面网格。
+- 歌曲支持分享、左滑触发删除确认。精确文档删除、Android 10/11 授权、授权状态恢复、SAF/MediaStore 别名清理及队列一次性更新已接线；不存在的 URI 不生成幽灵条目。开发过程未删除用户音频。
+- 新增库官方源码位于 third_party/jaudiotagger-3.0.1；源码归档保留 Gradle wrapper 和许可，不包含私钥、local.properties、构建缓存、旧包或用户样本。
+- 首轮 assembleRelease 通过（2m15s）；删除授权与别名收尾后的最终 assembleRelease 再次通过（1m53s），v2签名/zipalign有效；版本1.6/code7。APK为dist/余音-v1.6-下载与资料库完善.apk，源码包同名前缀-source.tar.gz，详情见RELEASE.md。
+- 签名兼容有明确边界：本包与旧Cupertino/液态玻璃下载刷新包同签名，与“当前进度预览”包不同；未找到后者原密钥，不能保证覆盖该预览包，不能要求用户卸载丢数据。真机操作未验收。
+
+## 最新接续：设置崩溃、下载闭环、元数据与音质
+
+**当前统一清单见 [TODO.md](TODO.md)。以下旧轮次记录只作历史，不用旧勾选推断现状。**
+
+- 保留开工时已有的 AppSheet、LibraryScreen、LocalMusicApp 和本文件未提交改动，版本仍 1.6 / code7。
+- 闪退已有用户堆栈：CupertinoTheme 覆盖 LocalIndication 为旧实现，新版 clickable 拒绝。现在在主题内部恢复 node-based PressFadeIndication，保留 CupertinoSwitch；不使用将被移除的兼容 flag。
+- 下载增加独立页面/持久历史、真实进度、单次音质选择及独立默认音质；两项内嵌默认开，旧附加文件分支撤除。标签写入器先写应用临时副本并回读，后发布，不触碰原音频。失败/缺失/不支持格式明确警告。
+- 完成发布后媒体扫描、库登记及广播；资料库监控 MediaStore、回前台及返回标签页刷新。Lyrico 包可见性/安装检测/编辑 Intent 与启动回退已补；目标 URI 强制刷新并带元数据版本，队列/页面/通知封面同步而不重建播放器。
+- 音质改为真实 codec/header 证据，不凭 MIME/扩展名发无损徽标；HR 同时要求源位深和采样率证据。资料库 SAF/MediaStore 仅按能证明的身份去重。
+- 弹窗按用户参考精修，切歌增加可中断交叉渐变；不改变认可的播放页布局、字号及歌词曲线。
+- 已通过 Kotlin 编译、局部音质检查和真实 WAV 内嵌回读；未做全量构建/lint，未生成新版 APK，未进行真机触控/下载/SAF 验收。不要交付旧 dist APK 充当本次结果。
+- 历史漏项已在 TODO.md 明列：暂停封面、收藏触感、队列小标、歌词长按分享、真实添加时间/路径、资料库分享删除/侧滑、主页重做及许可入口。A–Z/共享封面/滑条反馈等旧的未勾项已澄清为“已有代码，待验收”。
+
+## 本次接续：按用户要求先打包当前进度
+
+- Cupertino 依赖和设置里的 CupertinoSwitch 保留，已撤回误写的自定义开关。播放页和歌词 UI 源文件未修改。
+- 现有 AppSheet 底部抽屉改为居中浮卡、移除抓手并保留 IME padding；创建歌单遮挡的真机行为仍需核验。
+- 主页目前仅落盘分类行样式/按压和空统计隐藏，完整主页重做尚未完成；用户最新要求直接打包，停止继续扩展修改。
+- 设置入口移除额外 Haze 源和进入设置时的网络刷新；没有崩溃堆栈及可操作设备，不能宣称闪退已确证修复。锚定弹窗完整材质重做也未完成。
+- 版本维持 1.6 / code7；assembleRelease 已通过（3m25s），使用现有系统 AAPT2 路径覆盖、跳过 lintVital。交付 dist/余音-v1.6-当前进度预览.apk 及对应源码包；未真机验收。
+
 构建：liblinuxrun.so bash -lc 'cd /sdcard/AndroidCSProjects/xuebimc && bash ./gradlew assembleRelease --offline --no-daemon -x lintVitalAnalyzeRelease -x lintVitalReportRelease -x lintVitalRelease > /root/xuebimc-build.log 2>&1'
 版本号保持 1.6，不要升。子代理按文件分工；主线程负责衔接，小步写、勤落盘。
 行为规格见 BEHAVIOR.md。

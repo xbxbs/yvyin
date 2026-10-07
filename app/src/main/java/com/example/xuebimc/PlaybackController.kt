@@ -217,6 +217,37 @@ class PlaybackController(context: Context) {
         changed()
     }
 
+    /** Refresh every queued local occurrence without seeking, restarting playback or changing order. */
+    fun refreshLibraryMetadata(tracks: List<Track>) {
+        if (isReleased) return
+        scheduler.setAutoplayLibrary(tracks)
+        val freshByKey = tracks.filterNot { it.isOnline }.associateBy { it.stableKey }
+        var updated = false
+        queue.filterNot { it.isOnline }.distinctBy { it.stableKey }.forEach { previous ->
+            val fresh = freshByKey[previous.stableKey] ?: return@forEach
+            val replacement = if (fresh.metadataRevision == previous.metadataRevision) {
+                // MediaStore scans do not contain probed quality/lyrics; keep them only when
+                // the file is unchanged. A changed revision deliberately starts clean.
+                fresh.copy(
+                    codecMimeType = fresh.codecMimeType ?: previous.codecMimeType,
+                    sampleRate = fresh.sampleRate.takeIf { it > 0 } ?: previous.sampleRate,
+                    bits = fresh.bits.takeIf { it > 0 } ?: previous.bits,
+                    bitrate = fresh.bitrate.takeIf { it > 0L } ?: previous.bitrate,
+                    lines = fresh.lines.ifEmpty { previous.lines },
+                )
+            } else fresh
+            if (replacement != previous) {
+                scheduler.updateTrack(replacement)
+                updated = true
+            }
+        }
+        if (updated) {
+            publishQueue()
+            if (!ready || durationMs <= 0L) durationMs = currentTrack?.durationMs?.coerceAtLeast(0L) ?: 0L
+            changed()
+        }
+    }
+
     private fun publishQueue() {
         fun project(entry: PlaybackQueue.Entry<Track>) = QueueEntry(
             id = entry.id,
@@ -314,6 +345,32 @@ class PlaybackController(context: Context) {
     fun removeQueueEntry(id: String) {
         if (isReleased) return
         scheduler.remove(id)
+        publishQueue()
+        changed()
+    }
+
+    /** Call only after successful file deletion; this updates playback and never deletes a file. */
+    fun removeDeletedTrack(stableKey: String) = removeDeletedTracks(setOf(stableKey))
+
+    /** Batch URI aliases so a deleted alias can never become an intermediate next track. */
+    fun removeDeletedTracks(stableKeys: Set<String>) {
+        if (isReleased || stableKeys.isEmpty()) return
+        val autoPlay = playing || playbackRequested
+        val removedCurrent = scheduler.removeTracks(stableKeys)
+        if (removedCurrent && scheduler.current != null) {
+            loadCurrent(autoPlay, userRequest = true)
+            return
+        }
+        if (removedCurrent) {
+            pause()
+            disposePlayer()
+            durationMs = 0L
+            positionMs = 0L
+            timeline.reset(0L, SystemClock.elapsedRealtime())
+            favorite = false
+            error = null
+            seekRevision++
+        }
         publishQueue()
         changed()
     }

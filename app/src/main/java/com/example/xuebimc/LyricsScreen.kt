@@ -1,12 +1,15 @@
 package com.example.xuebimc
 
+import android.content.Intent
 import android.os.Build
+import android.widget.Toast
 import androidx.compose.animation.core.CubicBezierEasing
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.MutatePriority
-import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.foundation.gestures.Orientation
@@ -51,6 +54,7 @@ import androidx.compose.ui.graphics.layer.GraphicsLayer
 import androidx.compose.ui.graphics.layer.drawLayer
 import androidx.compose.ui.graphics.layer.CompositingStrategy as LayerCompositingStrategy
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.semantics.contentDescription
@@ -162,6 +166,7 @@ fun LyricsViewport(
     onSeek: (Long) -> Unit,
     onInteraction: () -> Unit,
 ) {
+    val context = LocalContext.current
     val density = LocalDensity.current
     val textMeasurer = rememberTextMeasurer(cacheSize = 64)
     val scope = rememberCoroutineScope()
@@ -474,6 +479,20 @@ fun LyricsViewport(
                                 gestureRevision++
                             }
                         },
+                        onShare = share@{
+                            // Match seek's drag/fling guard, including movement at scroll edges.
+                            if (tapBlocked || scrollState.isScrollInProgress) return@share
+                            val line = lines[index]
+                            val text = listOfNotNull(line.text.trim().takeIf { it.isNotEmpty() },
+                                line.translation?.trim()?.takeIf { it.isNotEmpty() })
+                                .distinct().joinToString("\n")
+                            if (text.isEmpty()) return@share
+                            interact()
+                            val send = Intent(Intent.ACTION_SEND).setType("text/plain")
+                                .putExtra(Intent.EXTRA_TEXT, text)
+                            runCatching { context.startActivity(Intent.createChooser(send, "分享歌词")) }
+                                .onFailure { Toast.makeText(context, "没有可用的分享应用", Toast.LENGTH_SHORT).show() }
+                        },
                     )
                 }
             }
@@ -495,6 +514,7 @@ fun LyricsViewport(
     }
 }
 
+@OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun AnimatedLyricRow(
     line: LyricLine,
@@ -507,6 +527,7 @@ private fun AnimatedLyricRow(
     paintPadding: Float,
     modifier: Modifier,
     onSeek: () -> Unit,
+    onShare: () -> Unit,
 ) {
     val density = LocalDensity.current
     val focus by animateFloatAsState(
@@ -643,11 +664,14 @@ private fun AnimatedLyricRow(
                 scaleX = motion.scale
                 scaleY = motion.scale
             }
-            .clickable(
+            .combinedClickable(
                 interactionSource = remember { MutableInteractionSource() },
                 indication = null,
                 role = Role.Button,
+                onClickLabel = "播放这一句",
                 onClick = onSeek,
+                onLongClickLabel = "分享这句歌词",
+                onLongClick = onShare,
             )
             .semantics { contentDescription = line.text },
     )

@@ -4,9 +4,15 @@ import android.Manifest
 import android.app.Activity
 import android.content.Context
 import android.content.Intent
+import android.content.BroadcastReceiver
+import android.content.IntentFilter
 import android.content.pm.PackageManager
+import android.database.ContentObserver
 import android.net.Uri
 import android.os.Build
+import android.os.Handler
+import android.os.Looper
+import android.provider.MediaStore
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -106,6 +112,12 @@ internal fun LocalMusicApp(
     var onlineOverlayVisible by remember { mutableStateOf(false) }
     var playlistOverlayVisible by remember { mutableStateOf(false) }
     var settingsOverlayVisible by remember { mutableStateOf(false) }
+    var downloadsVisible by rememberSaveable { mutableStateOf(false) }
+    var downloadTarget by remember { mutableStateOf<Track?>(null) }
+    var downloadMenuShowing by remember { mutableStateOf(false) }
+    var deleteTarget by remember { mutableStateOf<Track?>(null) }
+    var deletionShowing by remember { mutableStateOf(false) }
+    val downloadPreparations = remember { mutableStateListOf<DownloadPreparation>() }
     var libraryOpenRequest by remember { mutableStateOf<LibraryOpenRequest?>(null) }
     var libraryOpenRevision by rememberSaveable { mutableLongStateOf(0L) }
     var playlistVisible by remember { mutableStateOf(false) }
@@ -129,13 +141,58 @@ internal fun LocalMusicApp(
     var interactionRevision by remember { mutableIntStateOf(0) }
     val currentTrack = playback.currentTrack
     val listeningStats by playback.listeningStats.snapshot.collectAsState()
+    fun completeDeletion(track: Track, knownAliases: Set<String>) {
+        val aliases = knownAliases + track.uri.toString()
+        val deletedKeys = (library + playback.queue).filter { !it.isOnline && it.uri.toString() in aliases }
+            .map { it.stableKey }.toSet() + track.stableKey
+        synchronized(preferences) {
+            val saved = preferences.getStringSet("imported_uris", emptySet()).orEmpty().toSet() - aliases
+            preferences.edit().putStringSet("imported_uris", saved).apply {
+                aliases.forEach { remove("imported_at:$it") }
+            }.apply()
+        }
+        library = library.filterNot { it.stableKey in deletedKeys }
+        playback.removeDeletedTracks(deletedKeys)
+        repository.invalidateMetadata(track.uri)
+        scanRevision++
+        message = "已删除歌曲文件：${track.title}"
+        android.widget.Toast.makeText(context, message, android.widget.Toast.LENGTH_LONG).show()
+    }
     fun selectTab(tab: MusicTab) {
         focus.clearFocus()
         keyboard?.hide()
         if (selectedTab != tab) view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
         selectedTab = tab
+        downloadsVisible = false
+        downloadTarget = null
+        if (tab == MusicTab.Library) scanRevision++
         compactBar = false
         if (tab != MusicTab.Library) playlistVisible = false
+    }
+    fun openDownloads() {
+        focus.clearFocus()
+        keyboard?.hide()
+        downloadsVisible = true
+        compactBar = false
+    }
+    fun beginDownload(request: DownloadPreparation, prepared: PreparedMusicDownload? = null) {
+        downloadTarget = null
+        openDownloads()
+        val previous = downloadPreparations.indexOfFirst { it.key == request.key }
+        if (previous >= 0 && downloadPreparations[previous].error == null) return
+        val pending = request.copy(error = null)
+        if (previous >= 0) downloadPreparations[previous] = pending else downloadPreparations.add(0, pending)
+        scope.launch {
+            try {
+                val selected = prepared ?: onlineRepository.prepareDownload(pending.track, pending.quality)
+                onlineRepository.download(selected, pending.embedCover, pending.embedLyrics)
+                downloadPreparations.removeAll { it.key == pending.key }
+            } catch (cancelled: CancellationException) { throw cancelled }
+            catch (failure: Exception) {
+                val index = downloadPreparations.indexOfFirst { it.key == pending.key }
+                if (index >= 0) downloadPreparations[index] = pending.copy(error = failure.localizedMessage ?: "无法开始下载，请稍后重试。")
+            }
+        }
     }
     fun performOnlineSearch() {
         onlineSearchJob?.cancel()
@@ -175,33 +232,22 @@ internal fun LocalMusicApp(
         }
         playerVisible = false
     }
-    fun lyricoIntent(track: Track): Intent? {
-        if (track.isOnline) return null
-        val intent = Intent(Intent.ACTION_EDIT, track.uri).apply {
-            setPackage("com.lonx.lyrico")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            clipData = android.content.ClipData.newRawUri(track.title, track.uri)
-        }
-        return intent.takeIf { it.resolveActivity(context.packageManager) != null }
-    }
     LaunchedEffect(library) {
         playback.setAutoplayLibrary(library)
-        val current = playback.currentTrack ?: return@LaunchedEffect
-        val refreshed = library.firstOrNull { it.stableKey == current.stableKey } ?: return@LaunchedEffect
-        if (refreshed.title != current.title || refreshed.artist != current.artist || refreshed.album != current.album) {
-            playback.updateTrack(current.copy(
-                title = refreshed.title,
-                artist = refreshed.artist,
-                album = refreshed.album,
-                displayName = refreshed.displayName,
-            ))
-        }
+        playback.refreshLibraryMetadata(library)
     }
 
     LaunchedEffect(sheet) { sheet?.let { lastSheet = it } }
 
-    LaunchedEffect(onlineVisible, settingsVisible) {
-        if (onlineVisible || settingsVisible) onlineSources = onlineRepository.loadSources()
+    LaunchedEffect(onlineVisible) {
+        if (onlineVisible) {
+            try {
+                onlineSources = onlineRepository.loadSources()
+            } catch (cancelled: CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+            }
+        }
     }
     LaunchedEffect(appPreferenceValues.defaultOnlineSource) {
         val preferred = appPreferenceValues.defaultOnlineSource
@@ -226,7 +272,12 @@ internal fun LocalMusicApp(
         val observer = LifecycleEventObserver { _, event ->
             if (event == Lifecycle.Event.ON_RESUME) {
                 hasPermission = canReadAudio(context)
-                scanRevision++
+                val edited = MetadataEditor.consumeEditedUri()
+                if (edited != null) scope.launch {
+                    repository.invalidateMetadata(edited)
+                    MetadataEditor.rescan(context, edited)
+                    scanRevision++
+                } else scanRevision++
                 MusicDownloads.retryPending(context)
             }
         }
@@ -234,20 +285,44 @@ internal fun LocalMusicApp(
         onDispose { lifecycle.removeObserver(observer) }
     }
 
+    DisposableEffect(context, hasPermission) {
+        var pendingRefresh: kotlinx.coroutines.Job? = null
+        fun requestRefresh() {
+            pendingRefresh?.cancel()
+            pendingRefresh = scope.launch { delay(350L); scanRevision++ }
+        }
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) { requestRefresh() }
+        }
+        if (hasPermission) context.contentResolver.registerContentObserver(
+            MediaStore.Audio.Media.EXTERNAL_CONTENT_URI, true, observer)
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context, intent: Intent) {
+                if (intent.action == MusicDownloads.ACTION_LIBRARY_CHANGED) requestRefresh()
+            }
+        }
+        ContextCompat.registerReceiver(context, receiver, IntentFilter(MusicDownloads.ACTION_LIBRARY_CHANGED),
+            ContextCompat.RECEIVER_NOT_EXPORTED)
+        onDispose {
+            pendingRefresh?.cancel()
+            context.contentResolver.unregisterContentObserver(observer)
+            context.unregisterReceiver(receiver)
+        }
+    }
+
     LaunchedEffect(hasPermission, scanRevision) {
         loading = true
         try {
             val scanned = if (hasPermission) repository.scan() else emptyList()
             val imported = preferences.getStringSet("imported_uris", emptySet()).orEmpty().mapNotNull { value ->
-                try { repository.importAudio(Uri.parse(value)) }
+                try { repository.importAudio(Uri.parse(value), preferences.getLong("imported_at:$value", 0L)) }
                 catch (cancelled: CancellationException) { throw cancelled }
                 catch (_: Exception) { null }
             }
-            library = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.Default) {
-                (scanned + imported).distinctBy { it.stableKey }
-                    .sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
+            val combined = repository.mergeLibrary(scanned, imported)
+            library = withContext(Dispatchers.Default) {
+                combined.sortedWith(compareBy(String.CASE_INSENSITIVE_ORDER) { it.title })
             }
-            if (hasPermission) message = null
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Exception) {
@@ -300,9 +375,13 @@ internal fun LocalMusicApp(
             runCatching { context.contentResolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION) }
             scope.launch {
                 try {
-                    val track = repository.importAudio(uri)
-                    val saved = preferences.getStringSet("imported_uris", emptySet()).orEmpty().toSet() + uri.toString()
-                    preferences.edit().putStringSet("imported_uris", saved).apply()
+                    val addedAt = preferences.getLong("imported_at:$uri", 0L).takeIf { it > 0L } ?: System.currentTimeMillis()
+                    val track = repository.importAudio(uri, addedAt)
+                    synchronized(preferences) {
+                        val saved = preferences.getStringSet("imported_uris", emptySet()).orEmpty().toSet() + uri.toString()
+                        preferences.edit().putStringSet("imported_uris", saved)
+                            .putLong("imported_at:$uri", addedAt).apply()
+                    }
                     library = (library + track).distinctBy { it.stableKey }
                     message = null
                     selectTrack(track)
@@ -328,7 +407,7 @@ internal fun LocalMusicApp(
             }
         }
     }
-    LaunchedEffect(currentTrack?.stableKey) {
+    LaunchedEffect(currentTrack?.stableKey, currentTrack?.metadataRevision) {
         val target = currentTrack ?: return@LaunchedEffect
         try {
             val tags = if (target.isOnline) onlineRepository.resolveMetadata(target) { artwork ->
@@ -340,7 +419,9 @@ internal fun LocalMusicApp(
                     }
                 }
             } else repository.loadDetails(target)
-            val latest = playback.currentTrack?.takeIf { it.stableKey == target.stableKey } ?: return@LaunchedEffect
+            val latest = playback.currentTrack?.takeIf {
+                it.stableKey == target.stableKey && it.metadataRevision == target.metadataRevision
+            } ?: return@LaunchedEffect
             val detailed = if (target.isOnline) latest.copy(
                 artworkUri = tags.artworkUri ?: latest.artworkUri,
                 lines = tags.lines.ifEmpty { latest.lines },
@@ -379,12 +460,14 @@ internal fun LocalMusicApp(
             }
         }
     }
-    BackHandler(playerVisible || onlineVisible || playlistVisible || settingsVisible || sheet != null) {
+    BackHandler(playerVisible || onlineVisible || playlistVisible || settingsVisible || downloadsVisible || downloadTarget != null || sheet != null) {
         when {
+            downloadTarget != null -> downloadTarget = null
             sheet != null -> sheet = null
             lyricsVisible && playerVisible -> lyricsVisible = false
             queueVisible && playerVisible -> queueVisible = false
             playerVisible -> playerVisible = false
+            downloadsVisible -> { downloadsVisible = false; scanRevision++ }
             settingsVisible -> selectTab(MusicTab.Library)
             playlistVisible -> playlistVisible = false
             else -> selectTab(MusicTab.Library)
@@ -418,6 +501,8 @@ internal fun LocalMusicApp(
     val onlinePresent by remember { derivedStateOf { onlineVisible || onlineProgress.value > 0.001f } }
     LaunchedEffect(playerVisible, playerDragging) {
         if (playerDragging) return@LaunchedEffect
+        // Let the newly composed endpoints register at p=0 before the shared container moves.
+        if (playerVisible && playerProgress.value == 0f) withFrameNanos { }
         val initialVelocity = if (dragHandoff[0]) {
             playerProgress.snapTo(playerDragProgress)
             dragHandoff[0] = false
@@ -435,7 +520,12 @@ internal fun LocalMusicApp(
     }
     val sheetCorner = RoundedCornerShape(28.dp)
     val bottomBackdrop = remember { HazeState() }
-    val liquidBackdrop = rememberLayerBackdrop()
+    val liquidBackdrop = rememberLayerBackdrop {
+        // KernelSU also records an opaque page base before the body. Transparent capture
+        // leaves old cover colours in the refraction when switching a dark destination.
+        drawRect(Color.Black)
+        drawContent()
+    }
     var barHeight by remember { mutableStateOf(0.dp) }
     val recordLibraryBackdrop = !playerCovered
 
@@ -443,11 +533,14 @@ internal fun LocalMusicApp(
         LocalAnimatedBackground provides appPreferenceValues.animatedBackground,
         LocalLiquidGlass provides appPreferenceValues.liquidGlass,
     ) {
+    PlayerSurfaceTransition(playerExpansion, currentTrack?.stableKey) {
     SharedArtworkTransition(
         playerExpansion = playerExpansion,
+        playerAtRootOrigin = true,
         enabled = !lyricsVisible && !queueVisible && sheet == null && !playlistAddVisible &&
-            !libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible && !settingsOverlayVisible,
+            !libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible && !settingsOverlayVisible && !downloadMenuShowing && !deletionShowing,
     ) {
+    val playerTravelDistance = playerSurfaceTravelDistance { playerHeight }
     Box(Modifier.fillMaxSize().background(Color.Black).onSizeChanged { playerHeight = it.height.toFloat().coerceAtLeast(1f) }) {
         // Base world (library + online), receding like an iOS card while the player rises.
         Box(Modifier.fillMaxSize().graphicsLayer {
@@ -485,7 +578,7 @@ internal fun LocalMusicApp(
                         audioPermissionLauncher.launch(audioPermission())
                     }
                 },
-                onRefresh = { scanRevision++ },
+                onRefresh = { repository.invalidateMetadata(); scanRevision++ },
                 onSelect = { selectTrack(it) },
                 onOpenPlayer = { if (playback.currentTrack != null) playerVisible = true },
                 onTogglePlayback = playback::togglePlayback,
@@ -503,10 +596,12 @@ internal fun LocalMusicApp(
                 onOverlayVisibilityChange = { libraryOverlayVisible = it },
                 bottomInset = barHeight,
                 backdrop = bottomBackdrop,
-                backdropVisible = recordLibraryBackdrop && !onlineCovered && !settingsCovered && !playlistCovered,
+                backdropVisible = recordLibraryBackdrop && !onlineCovered && !settingsCovered && !playlistCovered && !downloadsVisible,
                 onScrollDirection = { if (selectedTab == MusicTab.Library) compactBar = it },
-                isActive = !playerPresent && !onlineVisible && !playlistPresent && !settingsPresent && sheet == null && !playlistAddVisible,
+                isActive = !playerPresent && !onlineVisible && !playlistPresent && !settingsPresent && !downloadsVisible && sheet == null && !playlistAddVisible && deleteTarget == null,
                 onPlaylists = { playlistVisible = true },
+                onDownloads = ::openDownloads,
+                onDeleteTrack = { deleteTarget = it },
                 playlistCount = savedPlaylists.size,
                 onAddToPlaylist = { playlistAddTracks = it; playlistAddVisible = true },
             )
@@ -520,7 +615,7 @@ internal fun LocalMusicApp(
                 externalQueryRevision = relatedSearchRevision,
                 isPlaying = playback.playing && onlineVisible && !playerCovered && !settingsCovered,
                 onScrollDirection = { if (onlineVisible) compactBar = it },
-                isActive = onlineVisible && !playerPresent && !settingsPresent && !playlistPresent && !playlistAddVisible && sheet == null,
+                isActive = onlineVisible && !playerPresent && !settingsPresent && !playlistPresent && !downloadsVisible && downloadTarget == null && !playlistAddVisible && sheet == null,
                 bottomInset = barHeight,
                 currentTrack = currentTrack,
                 sources = onlineSources,
@@ -545,26 +640,7 @@ internal fun LocalMusicApp(
                 onPlayFromList = ::playOnlineTrack,
                 onSave = { onlineSaved = onlineRepository.saveTrack(it) },
                 onRemove = { onlineSaved = onlineRepository.removeTrack(it) },
-                onDownload = { track ->
-                    scope.launch {
-                        try {
-                            val id = onlineRepository.download(track)
-                            onlineError = "正在下载…"
-                            scope.launch {
-                                repeat(180) {
-                                    delay(1_000L)
-                                    if (MusicDownloads.isDownloadComplete(context, id)) {
-                                        scanRevision++
-                                        selectTab(MusicTab.Library)
-                                        message = "下载完成，资料库已刷新"
-                                        return@launch
-                                    }
-                                }
-                            }
-                        } catch (cancelled: CancellationException) { throw cancelled }
-                        catch (failure: Exception) { onlineError = failure.localizedMessage ?: "下载失败" }
-                    }
-                },
+                onDownload = { track -> downloadTarget = track },
                 onAddToPlaylist = { playlistAddTracks = it; playlistAddVisible = true },
                 onOverlayVisibilityChange = { onlineOverlayVisible = it },
             )
@@ -577,7 +653,7 @@ internal fun LocalMusicApp(
             PlaylistScreen(
                 repository = playlists, library = library, currentTrack = currentTrack,
                 isPlaying = playback.playing, bottomInset = barHeight,
-                isActive = playlistVisible && !playerPresent && !onlineVisible && !settingsPresent && sheet == null && !playlistAddVisible,
+                isActive = playlistVisible && !playerPresent && !onlineVisible && !settingsPresent && !downloadsVisible && sheet == null && !playlistAddVisible,
                 onBack = { playlistVisible = false },
                 onPlay = { track, tracks, name -> selectTrack(track, tracks, "播放列表：$name") },
                 onShuffle = { tracks, name -> tracks.randomOrNull()?.let {
@@ -590,21 +666,44 @@ internal fun LocalMusicApp(
         }
         if (settingsPresent) Box(Modifier.fillMaxSize().graphicsLayer {
             alpha = settingsProgress.value.coerceIn(0f, 1f)
-        }.background(Color.Black).then(if (recordLibraryBackdrop) Modifier.hazeSource(bottomBackdrop, zIndex = 3f) else Modifier)
+        }.background(Color.Black)
             .pointerInput(Unit) { detectTapGestures {} }) {
             tabStates.SaveableStateProvider("settings") {
                 SettingsScreen(
                     preferences = appPreferences, sources = onlineSources,
                     currentSourceId = onlineSourceId, bottomInset = barHeight,
-                    isActive = settingsVisible && !playerPresent,
+                    isActive = settingsVisible && !playerPresent && !downloadsVisible,
+                    onDownloads = ::openDownloads,
                     onOverlayVisibilityChange = { settingsOverlayVisible = it },
                     onBack = { selectTab(MusicTab.Library) },
                     onDeveloperOptions = { frameRateMonitor.captureBeforeInfo(lyricsVisible); sheet = "developer" },
                 )
             }
         }
+        if (downloadsVisible) Box(Modifier.fillMaxSize().background(Color.Black)
+            .then(if (recordLibraryBackdrop) Modifier.hazeSource(bottomBackdrop, zIndex = 4f) else Modifier)
+            .pointerInput(Unit) { detectTapGestures {} }) {
+            DownloadsScreen(
+                preparations = downloadPreparations.toList(), bottomInset = barHeight,
+                isActive = !playerPresent && downloadTarget == null,
+                onBack = { downloadsVisible = false; scanRevision++ },
+                onBrowse = { selectTab(MusicTab.Online) },
+                onOpen = { task -> task.documentUri?.let { value -> scope.launch {
+                    try {
+                        val track = repository.importAudio(Uri.parse(value))
+                        downloadsVisible = false
+                        selectTrack(track, listOf(track), "下载")
+                    } catch (cancelled: CancellationException) { throw cancelled }
+                    catch (_: Exception) {
+                        android.widget.Toast.makeText(context, "文件已移动或无法读取，请检查下载目录。", android.widget.Toast.LENGTH_LONG).show()
+                    }
+                } } },
+                onRetryPreparation = { beginDownload(it) },
+                onDismissPreparation = { key -> downloadPreparations.removeAll { it.key == key && it.error != null } },
+            )
         }
-        if (!libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible && !settingsOverlayVisible) GlassTabBar(
+        }
+        if (!libraryOverlayVisible && !onlineOverlayVisible && !playlistOverlayVisible && !settingsOverlayVisible && !downloadMenuShowing && !deletionShowing) GlassTabBar(
             backdrop = bottomBackdrop,
             liquidBackdrop = liquidBackdrop.takeIf { appPreferenceValues.liquidGlass },
             track = currentTrack,
@@ -621,12 +720,7 @@ internal fun LocalMusicApp(
             modifier = Modifier.align(Alignment.BottomCenter),
         )
         }
-        if (playerPresent && currentTrack != null) Box(Modifier.fillMaxSize().graphicsLayer {
-            val p = playerExpansion().coerceIn(0f, 1f)
-            translationY = (1f - p) * size.height
-            shape = sheetCorner
-            clip = p < 0.999f
-        }) {
+        if (playerPresent && currentTrack != null) Box(Modifier.fillMaxSize().sharedPlayerSurface()) {
             PlayerScreen(
                 title = currentTrack.title,
                 artist = currentTrack.artist,
@@ -635,6 +729,9 @@ internal fun LocalMusicApp(
                 isPlaying = playback.playing,
                 volume = playback.volume,
                 isFavorite = playback.favorite,
+                queueShuffled = playback.shuffled,
+                queueRepeatMode = playback.repeatMode,
+                queueAutoplayEnabled = playback.autoplayEnabled,
                 onTogglePlay = playback::togglePlayback,
                 onSeek = playback::seek,
                 onVolumeChange = playback::changeVolume,
@@ -663,13 +760,13 @@ internal fun LocalMusicApp(
                         playerDragProgress = playerProgress.value
                         playerDragging = true
                     }
-                    playerDragProgress = (playerDragProgress - delta / playerHeight).coerceIn(0f, 1f)
+                    playerDragProgress = (playerDragProgress - delta / playerTravelDistance()).coerceIn(0f, 1f)
                 },
                 onDismissRelease = { velocity ->
                     if (playerDragging) {
-                        val predicted = playerDragProgress - velocity / playerHeight * .14f
+                        val predicted = playerDragProgress - velocity / playerTravelDistance() * .14f
                         playerVisible = predicted >= .78f
-                        releaseVelocity[0] = -velocity / playerHeight
+                        releaseVelocity[0] = -velocity / playerTravelDistance()
                         dragHandoff[0] = true
                         playerDragging = false
                     }
@@ -732,11 +829,11 @@ internal fun LocalMusicApp(
                             SheetActionDivider()
                             SheetActionRow(if (playback.favorite) "取消收藏" else "收藏歌曲", PlayerIconType.Star,
                                 filledStar = playback.favorite, onClick = playback::toggleFavorite)
-                            lyricoIntent(track)?.let { editIntent ->
+                            if (!track.isOnline) {
                                 SheetActionDivider()
                                 SheetActionRow("编辑元数据", PlayerIconType.Info) {
-                                    runCatching { context.startActivity(editIntent) }
-                                        .onFailure { message = "无法打开 Lyrico" }
+                                    message = MetadataEditor.open(context, track)
+                                    message?.let { android.widget.Toast.makeText(context, it, android.widget.Toast.LENGTH_LONG).show() }
                                     sheet = null
                                 }
                             }
@@ -806,12 +903,35 @@ internal fun LocalMusicApp(
                     }
                 }
         }
-        AppContextMenu(visible = sheet != null, anchor = null, onDismiss = { sheet = null }) {
+        AppContextMenu(visible = sheet != null, anchor = null, onDismiss = { sheet = null },
+            presentation = if (kind == "more") ContextMenuPresentation.Menu else ContextMenuPresentation.Information,
+            title = when (kind) { "more" -> "歌曲菜单"; "output" -> "音频输出"; "developer" -> "开发者选项"; else -> "歌曲信息" }) {
             Column(Modifier.animateContentSize(spring(dampingRatio = 1f, stiffness = 500f))) {
                 SheetContents(kind)
             }
         }
         PlaylistAddSheet(playlists, playlistAddTracks, playlistAddVisible) { playlistAddVisible = false }
+        DownloadQualityMenu(downloadTarget, onlineSources, appPreferenceValues,
+            onDismiss = { downloadTarget = null }, onShowingChanged = { downloadMenuShowing = it },
+            onDownload = { prepared ->
+                val track = prepared.track
+                val quality = prepared.quality
+                beginDownload(DownloadPreparation("${track.stableKey}:${quality.level}", track, quality,
+                    appPreferenceValues.downloadEmbedCover, appPreferenceValues.downloadEmbedLyrics), prepared)
+            })
+        TrackDeletionDialog(deleteTarget, onDismiss = { deleteTarget = null },
+            onDeleted = ::completeDeletion,
+            resolveAliases = { track ->
+                val imported = synchronized(preferences) {
+                    preferences.getStringSet("imported_uris", emptySet()).orEmpty().toSet()
+                }
+                repository.aliasesFor(track, imported + (library + playback.queue).filterNot { it.isOnline }.map { it.uri.toString() })
+            },
+            onFeedback = { feedback ->
+                message = feedback
+                android.widget.Toast.makeText(context, feedback, android.widget.Toast.LENGTH_LONG).show()
+            }, onShowingChanged = { deletionShowing = it })
+    }
     }
     }
     }
@@ -847,13 +967,7 @@ internal fun MusicAction(label: String, onClick: () -> Unit) {
 
 @Composable
 private fun SheetTrackHeading(track: Track) {
-    Row(Modifier.fillMaxWidth().then(if (LocalInsideContextMenu.current) Modifier.padding(14.dp) else Modifier), verticalAlignment = Alignment.CenterVertically) {
-        TrackArtwork(track, Modifier.size(40.dp).clip(RoundedCornerShape(6.dp)), 128)
-        Column(Modifier.weight(1f).padding(start = 12.dp)) {
-            MusicText(track.title, 16f, true, maxLines = 2)
-            MusicText(track.artist, 13f, maxLines = 1)
-        }
-    }
+    SheetTrackHeader(track)
 }
 
 @Composable

@@ -1,11 +1,11 @@
 package com.example.xuebimc
 
 import androidx.compose.foundation.Canvas
-import androidx.compose.animation.animateColorAsState
 import androidx.compose.animation.core.animateFloatAsState
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.focusable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -29,20 +29,34 @@ import androidx.compose.foundation.text.BasicText
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.SideEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.clipToBounds
+import androidx.compose.ui.draw.alpha
 import androidx.compose.ui.geometry.CornerRadius
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.Path
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.StrokeJoin
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.input.key.Key
+import androidx.compose.ui.input.key.KeyEventType
+import androidx.compose.ui.input.key.key
+import androidx.compose.ui.input.key.type
+import androidx.compose.ui.input.key.onKeyEvent
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.LocalView
 import androidx.compose.ui.layout.Layout
 import androidx.compose.ui.unit.Constraints
 import androidx.compose.ui.semantics.Role
@@ -51,6 +65,8 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.stateDescription
+import androidx.compose.ui.semantics.onClick
+import androidx.compose.ui.semantics.role
 import androidx.compose.ui.text.PlatformTextStyle
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontFamily
@@ -61,8 +77,12 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.TextUnit
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.LayoutDirection
 import dev.chrisbanes.haze.HazeState
 import com.kyant.backdrop.backdrops.LayerBackdrop
+import com.kyant.backdrop.backdrops.layerBackdrop
+import com.kyant.backdrop.backdrops.rememberLayerBackdrop
+import com.kyant.backdrop.backdrops.rememberCombinedBackdrop
 import kotlin.math.PI
 import kotlin.math.cos
 import kotlin.math.sin
@@ -73,7 +93,7 @@ private val GlassInactive = Color(0xFFEBEBF5).copy(alpha = .6f)
 private val GlassSelected = Color(0xFFFA2D48)
 private val MiniPlayerRadius = 20.dp
 private val MiniPlayerInset = 8.dp
-private val TabBarRadius = 29.dp
+private val TabBarRadius = 32.dp
 private val TabBarInset = 4.dp
 private val NavigationItemWidth = 76.dp
 private val NavigationWidth = NavigationItemWidth * 3 + TabBarInset * 2
@@ -104,23 +124,13 @@ fun GlassTabBar(
     val navigationBottom = WindowInsets.navigationBars.asPaddingValues().calculateBottomPadding()
     // Reserve the expanded inset even while compact: changing list padding would reverse its
     // scroll direction and cause a collapse/expand feedback loop near the final songs.
-    val reservedInset = (if (track == null) 58.dp else 122.dp) + navigationBottom + 24.dp
+    val reservedInset = (if (track == null) 64.dp else 128.dp) + navigationBottom + 24.dp
     SideEffect { onHeightChange(reservedInset) }
     val collapse = animateFloatAsState(if (compact && track != null) 1f else 0f,
         spring(dampingRatio = .85f, stiffness = 380f), label = "bottomChromeCollapse")
     @Composable fun Tabs(modifier: Modifier = Modifier) {
-        Row(
-            modifier.width(NavigationWidth).height(58.dp)
-                .glassCapsule(backdrop, liquidBackdrop, RoundedCornerShape(TabBarRadius)).padding(TabBarInset),
-            verticalAlignment = Alignment.CenterVertically,
-        ) {
-            GlassTab("资料库", GlassTabIcon.Library, selected = selectedTab == MusicTab.Library,
-                onClick = { onSelectTab(MusicTab.Library) }, modifier = Modifier.width(NavigationItemWidth))
-            GlassTab("在线", GlassTabIcon.Online, selected = selectedTab == MusicTab.Online,
-                onClick = { onSelectTab(MusicTab.Online) }, modifier = Modifier.width(NavigationItemWidth))
-            GlassTab("设置", GlassTabIcon.Settings, selected = selectedTab == MusicTab.Settings,
-                onClick = { onSelectTab(MusicTab.Settings) }, modifier = Modifier.width(NavigationItemWidth))
-        }
+        LiquidNavigationBar(backdrop, liquidBackdrop, selectedTab, onSelectTab, modifier,
+            enabled = !compact || track == null)
     }
     Column(
         modifier
@@ -134,7 +144,8 @@ fun GlassTabBar(
             Layout(
                 modifier = Modifier.fillMaxWidth().clipToBounds(),
                 content = {
-                    Box(Modifier.glassCapsule(backdrop, liquidBackdrop, RoundedCornerShape(MiniPlayerRadius))) {
+                    Box(Modifier.sharedMiniPlayerSurface(track.stableKey)
+                        .glassCapsule(backdrop, liquidBackdrop, RoundedCornerShape(MiniPlayerRadius))) {
                         // The same mini-player stays composed throughout the morph.
                         GlassMiniPlayer(track, isPlaying, onOpenPlayer, onTogglePlayback, onPrevious, onNext)
                     }
@@ -157,7 +168,7 @@ fun GlassTabBar(
                 val p = collapse.value.coerceIn(0f, 1f)
                 val width = constraints.maxWidth
                 val miniHeight = 56.dp.roundToPx()
-                val tabsHeight = 58.dp.roundToPx()
+                val tabsHeight = 64.dp.roundToPx()
                 val gap = 8.dp.roundToPx()
                 val circleWidth = 56.dp.roundToPx()
                 val miniWidth = (width - ((circleWidth + gap) * p).roundToInt()).coerceAtLeast(1)
@@ -231,26 +242,83 @@ private fun GlassMiniPlayer(
 }
 
 @Composable
-private fun GlassTab(label: String, icon: GlassTabIcon, selected: Boolean, onClick: () -> Unit, modifier: Modifier) {
-    val color by animateColorAsState(if (selected) GlassSelected else GlassInactive,
-        spring(dampingRatio = .85f, stiffness = 500f), label = "tabInk")
-    val fill by animateColorAsState(if (selected) Color.White.copy(alpha = .065f) else Color.Transparent,
-        spring(dampingRatio = .85f, stiffness = 500f), label = "tabFill")
-    // The tap target fills its lane; only a small visual capsule sits behind the icon and label.
-    Box(
-        modifier.fillMaxHeight().clip(RoundedCornerShape(23.dp))
-            .clickable(role = Role.Tab, onClick = onClick)
-            .semantics { this.selected = selected },
-        contentAlignment = Alignment.Center,
-    ) {
-        Column(
-            Modifier.width(68.dp).height(46.dp).clip(RoundedCornerShape(23.dp)).background(fill),
-            horizontalAlignment = Alignment.CenterHorizontally,
-            verticalArrangement = Arrangement.Center,
-        ) {
-            GlassIcon(icon, Modifier.size(20.dp), color)
-            GlassText(label, Modifier.padding(top = 2.dp), size = 10.sp, color = color,
-                family = PlayerTypography.medium, align = TextAlign.Center)
+private fun LiquidNavigationBar(
+    backdrop: HazeState,
+    liquidBackdrop: LayerBackdrop?,
+    selectedTab: MusicTab,
+    onSelectTab: (MusicTab) -> Unit,
+    modifier: Modifier,
+    enabled: Boolean,
+) {
+    val scope = rememberCoroutineScope()
+    val motion = remember(scope) { LiquidNavigationMotion(selectedTab.ordinal, 3, scope) }
+    val motionAllowed = rememberLibraryMotionAllowed()
+    val latestSelect by rememberUpdatedState(onSelectTab)
+    val density = LocalDensity.current
+    val rtl = LocalLayoutDirection.current == LayoutDirection.Rtl
+    val view = LocalView.current
+    SideEffect { motion.motionAllowed = motionAllowed }
+    LaunchedEffect(selectedTab) { motion.syncSelection(selectedTab.ordinal) }
+    LaunchedEffect(enabled) { if (!enabled) motion.cancel() }
+    val shape = RoundedCornerShape(TabBarRadius)
+    val surfaceBackdrop = rememberLayerBackdrop()
+    val labelBackdrop = rememberLayerBackdrop()
+    val selectionBackdrop = rememberCombinedBackdrop(surfaceBackdrop, labelBackdrop)
+    val labels = listOf("资料库", "在线", "设置")
+    val icons = listOf(GlassTabIcon.Library, GlassTabIcon.Online, GlassTabIcon.Settings)
+    val lanePx = with(density) { NavigationItemWidth.toPx() }
+    val insetPx = with(density) { TabBarInset.toPx() }
+    fun activate(index: Int) {
+        if (motion.commit(index)) {
+            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+            latestSelect(MusicTab.entries[index])
+        }
+    }
+    @Composable fun Contents(color: Color?, accessible: Boolean) {
+        Row(Modifier.padding(TabBarInset).fillMaxWidth().height(56.dp), verticalAlignment = Alignment.CenterVertically) {
+            labels.forEachIndexed { index, label ->
+                val tint = color ?: if (index == selectedTab.ordinal) GlassSelected else GlassInactive
+                Column(Modifier.weight(1f).fillMaxHeight().then(if (accessible) Modifier
+                    .onKeyEvent { event ->
+                        if (enabled && event.type == KeyEventType.KeyUp && event.key in listOf(Key.Enter, Key.Spacebar, Key.DirectionCenter)) {
+                            activate(index); true
+                        } else false
+                    }.focusable(enabled).semantics(mergeDescendants = true) {
+                        role = Role.Tab
+                        selected = selectedTab.ordinal == index
+                        onClick(label = label) { if (enabled) activate(index); enabled }
+                    } else Modifier.clearAndSetSemantics {}),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    verticalArrangement = Arrangement.Center) {
+                    GlassIcon(icons[index], Modifier.size(22.dp), tint)
+                    GlassText(label, Modifier.padding(top = 3.dp), 11.sp, tint,
+                        family = PlayerTypography.latin, align = TextAlign.Center)
+                }
+            }
+        }
+    }
+    Box(modifier.width(NavigationWidth).height(64.dp)
+        .liquidNavigationGestures(motion, 3, insetPx, rtl, enabled) { index ->
+            view.performHapticFeedback(android.view.HapticFeedbackConstants.KEYBOARD_TAP)
+            latestSelect(MusicTab.entries[index])
+        }) {
+        Box(Modifier.matchParentSize().then(if (liquidBackdrop != null) Modifier.kyantLiquidGlass(
+            liquidBackdrop, shape, exportedBackdrop = surfaceBackdrop,
+            pressProgress = { motion.pressProgress }, highlightPosition = { (motion.value + .5f) / 3f },
+        ) else Modifier.musicGlassSurface(backdrop, shape)))
+        if (liquidBackdrop != null) {
+            // The moving lens samples a clean base and a hidden accent-ink layer, like KernelSU.
+            Box(Modifier.matchParentSize().alpha(0f).layerBackdrop(labelBackdrop)) { Contents(GlassSelected, false) }
+            Contents(GlassInactive, true)
+            Box(Modifier.padding(TabBarInset).width(NavigationItemWidth).height(56.dp)
+                .graphicsLayer { translationX = (if (rtl) 2f - motion.value else motion.value) * lanePx }
+                .liquidNavigationPill(selectionBackdrop, CircleShape, { motion.pressProgress }, { motion.velocity }, motionAllowed)
+                .clearAndSetSemantics {})
+        } else {
+            Box(Modifier.padding(TabBarInset).width(NavigationItemWidth).height(56.dp)
+                .graphicsLayer { translationX = (if (rtl) 2f - motion.value else motion.value) * lanePx }
+                .clip(CircleShape).background(Color.White.copy(alpha = .08f)).clearAndSetSemantics {})
+            Contents(null, true)
         }
     }
 }

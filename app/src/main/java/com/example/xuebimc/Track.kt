@@ -46,6 +46,12 @@ data class Track(
     val genre: String? = null,
     /** Reported average bit rate in bits/second; zero means unavailable. */
     val bitrate: Long = 0L,
+    /** Local-file version, independent of URI identity; invalidates tag, lyric and artwork reads. */
+    val metadataRevision: String = "",
+    /** Known library/import time in epoch milliseconds. Zero means historical time is unknown. */
+    val addedAtMs: Long = 0L,
+    /** Verified parent from DATA or an external-storage document ID; display only, never for I/O. */
+    val folderPath: String? = null,
 ) {
     val stableKey: String
         get() = if (isOnline && !sourceId.isNullOrBlank() && !sourceTrackId.isNullOrBlank()) {

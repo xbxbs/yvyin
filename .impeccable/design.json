@@ -1,0 +1,72 @@
+{
+  "schemaVersion": 2,
+  "generatedAt": "2026-10-07T16:18:42Z",
+  "title": "Design System: 余音",
+  "extensions": {
+    "colorMeta": {
+      "library-accent": { "role": "primary", "displayName": "既有红色操作色" },
+      "library-ground": { "role": "neutral", "displayName": "资料库黑底" },
+      "text-primary": { "role": "neutral", "displayName": "常规白色正文" },
+      "library-secondary": { "role": "neutral", "displayName": "资料库次级信息" },
+      "library-hairline": { "role": "neutral", "displayName": "低对比分隔" },
+      "library-raised": { "role": "neutral", "displayName": "既有抬升底色" },
+      "menu-text": { "role": "neutral", "displayName": "菜单动作与参数值" },
+      "information-label": { "role": "neutral", "displayName": "详情辅助标签" },
+      "popup-base": { "role": "neutral", "displayName": "弹层底色" },
+      "popup-tint": { "role": "neutral", "displayName": "弹层磨砂覆盖色" },
+      "popup-fallback": { "role": "neutral", "displayName": "弹层非模糊后备色" },
+      "navigation-tint": { "role": "neutral", "displayName": "导航中性覆盖色" }
+    },
+    "typographyMeta": {
+      "headline": { "displayName": "资料库标题", "purpose": "LibraryScreen.kt::LibraryText；不套用到原播放页。" },
+      "title": { "displayName": "区块标题", "purpose": "LibraryScreen.kt 的最近添加等内容标题。" },
+      "body": { "displayName": "首页入口与封面标题", "purpose": "LibraryScreen.kt；Android 系统 sans-serif，按系统字号缩放。" },
+      "label": { "displayName": "首页数量与次级说明", "purpose": "LibraryScreen.kt；与正文保持既有层级。" },
+      "menu-action": { "displayName": "菜单动作", "purpose": "AppSheet.kt::SheetActionRow；常规字重，允许两行。" },
+      "information-value": { "displayName": "歌曲参数值", "purpose": "PlayerInformation.kt::PlayerInformationRow；等宽数字与长值换行。" },
+      "navigation-label": { "displayName": "浮动导航标签", "purpose": "GlassTabBar.kt::GlassText；原生单行标签，不提供 HTML 预览。" }
+    },
+    "shadows": [
+      { "name": "popup-elevation", "value": "Compose graphicsLayer.shadowElevation = 12.dp.toPx()", "purpose": "AppContextMenu.kt：单一弹层的原生投影；非 CSS 等价物。" },
+      { "name": "navigation-shadow", "value": "Kyant Shadow(radius = 10.dp, offset = DpOffset(0.dp, 3.dp), color = Color.Black.copy(alpha = 0.2f))", "purpose": "LiquidGlass.kt：浮动基座与内容的分离。" },
+      { "name": "pressed-pill-inner-shadow", "value": "Kyant InnerShadow(radius = 8.dp * press, offset = DpOffset(0.dp, 2.dp * press), color = Color.Black.copy(alpha = 0.15f), alpha = press)", "purpose": "LiquidGlass.kt：只在允许动画且按压时生效。" }
+    ],
+    "motion": [
+      { "name": "navigation-settle", "value": "Compose spring(dampingRatio = 1f, stiffness = 620f, visibilityThreshold = 0.001f)", "purpose": "LiquidNavigationMotion.kt：松手位置与速度接续；新拖动可中断，无动画时 snapTo。" },
+      { "name": "navigation-pressure", "value": "Compose spring(dampingRatio = 1f, stiffness = 1100f)", "purpose": "LiquidNavigationMotion.kt：按压进度；无动画时 snapTo。" },
+      { "name": "navigation-release-projection", "value": "round(value + clamp(velocity * 0.1, -0.6, 0.6))", "purpose": "LiquidNavigationMotion.kt：短距离预测释放目标并限制到有效导航索引。" },
+      { "name": "popup-enter-exit", "value": "Compose spring(dampingRatio = 1f, stiffness = visible ? 550f : 700f); scale = 0.94f + 0.06f * progress", "purpose": "AppContextMenu.kt：动作菜单从触发点进出，详情采用居中轴点。" },
+      { "name": "popup-pull-return", "value": "Compose spring(dampingRatio = 0.9f, stiffness = 600f)", "purpose": "AppContextMenu.kt：顶部未消费下拉位移回弹；关闭阈值为64dp，结合0.12秒速度预测。" }
+    ],
+    "breakpoints": [
+      { "name": "landing-single-column", "value": "Android: fontScale > 1.25 || screenWidthDp < 340" },
+      { "name": "recent-three-columns", "value": "Android: screenWidthDp >= 600" },
+      { "name": "information-stacked", "value": "Android: stacked || fontScale > 1.2 || contentWidth < 250.dp || value.length > 32" },
+      { "name": "popup-width-cap", "value": "Android: min(targetWidth, availableWidth - 32.dp)" }
+    ]
+  },
+  "components": [],
+  "narrative": {
+    "northStar": "Apple Music 保留面与 KernelSU 浮动底栏",
+    "overview": "本文件记录用户已确认方向及当前原生 Compose 实现，不另造品牌概念。范围限于资料库首页、动作菜单、歌曲详情和浮动导航；原播放页的布局、字号、取色背景不是本轮重做对象。页面以黑底、白色正文和灰色辅助信息承载内容，沿用红色操作色；玻璃材料集中在浮动导航和弹层。\n\n方向合同见 [design/UI_REVISION.md](design/UI_REVISION.md)。底栏参考 KernelSU 提交 `e7b071100754b55e28be6930f9967d99adb4a385` 的 `FloatingBottomBar`，使用工程既有 Kyant Backdrop 管线适配；跟手状态和弹簧是本地实现，不等同于完整移植。本文依据源码提取，尚无可操作真机或模拟器的渲染与交互验收，不宣称像素一致或玻璃观感已获认可。\n\nFrontmatter 是已提取 token 的机器可读清单，dp/sp 保留 Android 单位，不可直接当作 CSS。最低触摸尺寸、宽度约束、Compose 弹簧和材质行为由下文及 `.impeccable/design.json` 补充。sidecar 的 `components` 留空，不制作需要虚构 CSS 运行时的原生组件预览，也不生成源码不存在的配色色阶。",
+    "keyCharacteristics": [
+      "内容先于装饰：平面入口之后直接呈现最近添加封面。",
+      "单一弹层材料：动作与详情分别组织，不在菜单内部套灰色圆卡。",
+      "导航随手指连续移动；松手后接续速度，保留原生语义操作。",
+      "使用 Android 系统字体与 dp/sp；不以网页预览代替原生证据。"
+    ],
+    "rules": [],
+    "dos": [
+      "Do 以当前原生 Compose 源码和方向合同为证据，使用 Android dp/sp 与系统字体。",
+      "Do 在窄屏或大字体下允许入口和参数重排，保留已实现的最小触摸区域。",
+      "Do 将动作菜单和歌曲详情作为宽度、信息密度不同的单层表面。",
+      "Do 在真机检查长中文、字体放大、RTL、键盘/TalkBack、拖动中断和玻璃合成后再作视觉验收。"
+    ],
+    "donts": [
+      "Don't 将本轮首页字号或布局规则扩散到已要求保留的播放页。",
+      "Don't 在当前动作菜单内重新叠加独立灰色圆卡，或给导航加入常驻色散与彩色光晕。",
+      "Don't 将 KernelSU 参考、源码检查、构建通过或网页模拟图称为原生界面已经一致或已验收。",
+      "Don't 为未观察到的主题、字体、配色色阶、组件状态或运行时编造 token。"
+    ]
+  }
+}

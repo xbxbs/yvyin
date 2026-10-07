@@ -29,8 +29,10 @@ data class AppPreferenceValues(
     val downloadTreeUri: String? = null,
     val downloadFolderName: String = "音乐/余音",
     val autoOpenPlayer: Boolean = true,
-    val liquidGlass: Boolean = false,
-    val downloadCompanionFiles: Boolean = false,
+    val liquidGlass: Boolean = true,
+    val downloadQuality: String = "standard",
+    val downloadEmbedCover: Boolean = true,
+    val downloadEmbedLyrics: Boolean = true,
 )
 
 /** SharedPreferences is shared across instances; use that same monitor for each read/modify/publish. */
@@ -67,7 +69,14 @@ class AppPreferences(context: Context) {
 
     fun setLiquidGlass(value: Boolean) = update { putBoolean(KEY_LIQUID_GLASS, value) }
 
-    fun setDownloadCompanionFiles(value: Boolean) = update { putBoolean(KEY_DOWNLOAD_COMPANION, value) }
+    fun setDownloadEmbedCover(value: Boolean) = update { putBoolean(KEY_DOWNLOAD_EMBED_COVER, value) }
+
+    fun setDownloadEmbedLyrics(value: Boolean) = update { putBoolean(KEY_DOWNLOAD_EMBED_LYRICS, value) }
+
+    fun setDownloadQuality(value: String) {
+        val quality = requireNotNull(OnlinePlaybackQuality.fromLevel(value)) { "不支持的下载音质" }
+        update { putString(KEY_DOWNLOAD_QUALITY, quality.level) }
+    }
 
     /** The source's published levels must also be checked by the UI and resolver. */
     fun setOnlineQuality(value: String) {
@@ -110,8 +119,10 @@ class AppPreferences(context: Context) {
         downloadFolderName = preferences.getString(KEY_DOWNLOAD_FOLDER_NAME, DEFAULT_DOWNLOAD_FOLDER)
             ?.takeIf { it.isNotBlank() } ?: DEFAULT_DOWNLOAD_FOLDER,
         autoOpenPlayer = preferences.getBoolean(KEY_AUTO_OPEN_PLAYER, true),
-        liquidGlass = preferences.getBoolean(KEY_LIQUID_GLASS, false),
-        downloadCompanionFiles = preferences.getBoolean(KEY_DOWNLOAD_COMPANION, false),
+        liquidGlass = preferences.getBoolean(KEY_LIQUID_GLASS, true),
+        downloadQuality = preferences.getString(KEY_DOWNLOAD_QUALITY, "standard") ?: "standard",
+        downloadEmbedCover = preferences.getBoolean(KEY_DOWNLOAD_EMBED_COVER, true),
+        downloadEmbedLyrics = preferences.getBoolean(KEY_DOWNLOAD_EMBED_LYRICS, true),
     )
 
     companion object {
@@ -124,12 +135,14 @@ class AppPreferences(context: Context) {
         const val KEY_DOWNLOAD_FOLDER_NAME = "download_folder_name"
         const val KEY_AUTO_OPEN_PLAYER = "auto_open_player"
         const val KEY_LIQUID_GLASS = "liquid_glass"
-        const val KEY_DOWNLOAD_COMPANION = "download_companion_files"
+        const val KEY_DOWNLOAD_QUALITY = "download_quality"
+        const val KEY_DOWNLOAD_EMBED_COVER = "download_embed_cover"
+        const val KEY_DOWNLOAD_EMBED_LYRICS = "download_embed_lyrics"
         const val DEFAULT_DOWNLOAD_FOLDER = "音乐/余音"
         val KEYS: Set<String> = setOf(
             KEY_ANIMATED_BACKGROUND, KEY_PREFER_HIGH_REFRESH, KEY_DEFAULT_ONLINE_SOURCE,
             KEY_ONLINE_QUALITY, KEY_DOWNLOAD_TREE_URI, KEY_DOWNLOAD_FOLDER_NAME, KEY_AUTO_OPEN_PLAYER, KEY_LIQUID_GLASS,
-            KEY_DOWNLOAD_COMPANION,
+            KEY_DOWNLOAD_QUALITY, KEY_DOWNLOAD_EMBED_COVER, KEY_DOWNLOAD_EMBED_LYRICS,
         )
     }
 }

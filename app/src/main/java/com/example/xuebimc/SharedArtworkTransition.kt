@@ -23,6 +23,7 @@ import androidx.compose.ui.geometry.Rect
 import androidx.compose.ui.geometry.RoundRect
 import androidx.compose.ui.geometry.lerp
 import androidx.compose.ui.graphics.Path
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.clipPath
 import androidx.compose.ui.graphics.drawscope.withTransform
 import androidx.compose.ui.graphics.layer.GraphicsLayer
@@ -32,9 +33,11 @@ import androidx.compose.ui.layout.LayoutCoordinates
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlin.math.roundToInt
 
 /**
  * Wrap the existing full-window app Box, OUTSIDE every hazeSource. Keep the mini composed until
@@ -56,6 +59,7 @@ internal fun SharedArtworkTransition(
     enabled: Boolean = true,
     backgroundScale: (Float) -> Float = { 1f - .07f * it },
     playerTranslationY: (progress: Float, heightPx: Float) -> Float = { p, height -> (1f - p) * height },
+    playerAtRootOrigin: Boolean = false,
     onReadyForOpen: (String?) -> Unit = {},
     content: @Composable () -> Unit,
 ) {
@@ -63,13 +67,16 @@ internal fun SharedArtworkTransition(
     val sharing = rememberUpdatedState(enabled)
     val baseScale = rememberUpdatedState(backgroundScale)
     val playerOffset = rememberUpdatedState(playerTranslationY)
+    val rootOrigin = rememberUpdatedState(playerAtRootOrigin)
     val reportReady = rememberUpdatedState(onReadyForOpen)
+    val shadowLayer = rememberGraphicsLayer()
     val host = remember {
         ArtworkTransfer(
             progress = { progress.value().coerceIn(0f, 1f) },
             enabled = { sharing.value },
             baseScale = { baseScale.value(it) },
             playerOffset = { p, height -> playerOffset.value(p, height) },
+            playerAtRootOrigin = { rootOrigin.value },
         )
     }
     LaunchedEffect(host) {
@@ -94,6 +101,23 @@ internal fun SharedArtworkTransition(
                             val width = layer.size.width.toFloat()
                             val height = layer.size.height.toFloat()
                             if (width <= 0f || height <= 0f) return@onDrawBehind
+                            // The lifted cover owns its shadow as well. Leaving the player's
+                            // shadow behind would reveal a second, sliding cover during flight.
+                            if (frame.shadowElevation > 0f) {
+                                shadowLayer.record(
+                                    size = IntSize(frame.bounds.width.roundToInt().coerceAtLeast(1),
+                                        frame.bounds.height.roundToInt().coerceAtLeast(1)),
+                                ) {
+                                    drawRoundRect(Color.Black, cornerRadius = CornerRadius(frame.radius))
+                                }
+                                shadowLayer.setRoundRectOutline(cornerRadius = frame.radius)
+                                shadowLayer.shadowElevation = frame.shadowElevation
+                                shadowLayer.ambientShadowColor = Color.Black.copy(alpha = .24f)
+                                shadowLayer.spotShadowColor = Color.Black.copy(alpha = .36f)
+                                withTransform({ translate(frame.bounds.left, frame.bounds.top) }) {
+                                    drawLayer(shadowLayer)
+                                }
+                            }
                             clip.reset()
                             clip.addRoundRect(RoundRect(frame.bounds, CornerRadius(frame.radius)))
                             clipPath(clip) {
@@ -143,23 +167,25 @@ internal fun Modifier.sharedArtworkPlayerViewport(): Modifier {
     return onGloballyPositioned { viewport.coordinates = it }
 }
 
-/** fullBounds are the existing cover geometry in the untransformed PlayerScreen viewport. */
+/** Live geometry in the untransformed viewport; reads run in drawing, not recomposition. */
 @Composable
 internal fun Modifier.sharedPlayerArtwork(
     track: Track?,
-    fullBounds: Rect,
+    fullBounds: () -> Rect,
     enabled: Boolean,
     cornerRadius: Dp = 9.dp,
+    shadowElevationPx: () -> Float = { 0f },
 ): Modifier {
     val host = LocalArtworkTransfer.current ?: return this
     val key = track?.stableKey?.takeIf { it.isNotBlank() } ?: return this
     if (!enabled) return this
     val layer = rememberGraphicsLayer()
     val radius = with(LocalDensity.current) { cornerRadius.toPx() }
-    val destination = remember(host, key, layer) { ArtworkDestination(key, layer, fullBounds, radius) }
+    val destination = remember(host, key, layer) { ArtworkDestination(key, layer, fullBounds, radius, shadowElevationPx) }
     SideEffect {
         destination.bounds = fullBounds
         destination.radius = radius
+        destination.shadowElevation = shadowElevationPx
     }
     DisposableEffect(host, destination) {
         host.destination = destination
@@ -172,6 +198,13 @@ internal fun Modifier.sharedPlayerArtwork(
             if (host.frame() == null) drawLayer(layer)
         }
     }
+}
+
+/** Draw-time ownership also removes the full-size endpoint shadow while the overlay flies. */
+@Composable
+internal fun sharedArtworkInFlight(): () -> Boolean {
+    val host = LocalArtworkTransfer.current
+    return remember(host) { { host?.inFlight() == true } }
 }
 
 private val LocalArtworkTransfer = staticCompositionLocalOf<ArtworkTransfer?> { null }
@@ -189,21 +222,30 @@ private class ArtworkViewport {
 private class ArtworkDestination(
     val key: String,
     val layer: GraphicsLayer,
-    bounds: Rect,
+    bounds: () -> Rect,
     radius: Float,
+    shadowElevation: () -> Float,
 ) {
     var bounds by mutableStateOf(bounds)
     var radius by mutableStateOf(radius)
+    var shadowElevation by mutableStateOf(shadowElevation)
     var recorded by mutableStateOf(false)
 }
 
-private data class ArtworkFrame(val key: String, val layer: GraphicsLayer, val bounds: Rect, val radius: Float)
+private data class ArtworkFrame(
+    val key: String,
+    val layer: GraphicsLayer,
+    val bounds: Rect,
+    val radius: Float,
+    val shadowElevation: Float,
+)
 
 private class ArtworkTransfer(
     val progress: () -> Float,
     val enabled: () -> Boolean,
     val baseScale: (Float) -> Float,
     val playerOffset: (Float, Float) -> Float,
+    val playerAtRootOrigin: () -> Boolean,
 ) {
     var root by mutableStateOf<LayoutCoordinates?>(null)
     var source by mutableStateOf<ArtworkSource?>(null)
@@ -219,9 +261,14 @@ private class ArtworkTransfer(
         val small = source ?: return null
         val large = destination ?: return null
         if (small.key != large.key || root?.isAttached != true || small.coordinates?.isAttached != true ||
-            viewport?.coordinates?.isAttached != true || !large.bounds.usable()) return null
+            viewport?.coordinates?.isAttached != true || !large.bounds().usable()) return null
         if (!small.layer.usable(small.recorded) && !large.layer.usable(large.recorded)) return null
         return small.key
+    }
+
+    fun inFlight(): Boolean {
+        val p = progress()
+        return p > 0f && p < 1f && preparedKey() != null
     }
 
     /** One decision for mini, player and overlay, made before any of them paints. */
@@ -277,14 +324,15 @@ private class ArtworkTransfer(
             (observedMini.topLeft - pivot) / scale + pivot,
             (observedMini.bottomRight - pivot) / scale + pivot,
         )
-        val playerOrigin = root.localPositionOf(player, Offset.Zero) -
-            Offset(0f, playerOffset(p, root.size.height.toFloat()))
-        val fullBounds = large.bounds.translate(playerOrigin)
+        val playerOrigin = if (playerAtRootOrigin()) Offset.Zero else
+            root.localPositionOf(player, Offset.Zero) - Offset(0f, playerOffset(p, root.size.height.toFloat()))
+        val fullBounds = large.bounds().translate(playerOrigin)
         if (!miniBounds.usable() || !fullBounds.usable()) return null
         return ArtworkFrame(
             small.key, layer,
             lerp(miniBounds, fullBounds, p),
             (small.radius + (large.radius - small.radius) * p).coerceAtLeast(0f),
+            large.shadowElevation().coerceAtLeast(0f) * p,
         )
     }
 }

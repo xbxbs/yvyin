@@ -59,6 +59,8 @@ dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
     implementation("com.squareup.okio:okio:3.9.0")
+    // Native file tags: ID3/APIC, FLAC/Vorbis comments and MP4 covr/lyrics (no sidecars).
+    implementation("net.jthink:jaudiotagger:3.0.1")
     // JDK bridge only; implementations remain in kotlin-stdlib 2.1.0.
     implementation("org.jetbrains.kotlin:kotlin-stdlib-jdk8:1.9.0")
     implementation("io.github.alexzhirkevich:cupertino-android:0.1.0-alpha04")

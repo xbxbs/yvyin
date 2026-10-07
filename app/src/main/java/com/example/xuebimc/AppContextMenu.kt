@@ -5,7 +5,6 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.core.AnimationVector1D
 import androidx.compose.animation.core.spring
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
@@ -54,8 +53,13 @@ private data class MenuRequest(
     val dismiss: State<() -> Unit>,
     val showing: State<(Boolean) -> Unit>,
     val header: State<(@Composable () -> Unit)?>,
+    val presentation: ContextMenuPresentation,
+    val title: State<String>,
     val content: State<@Composable ColumnScope.() -> Unit>,
 )
+
+/** Actions stay attached to their trigger; longer information gets its own readable surface. */
+internal enum class ContextMenuPresentation { Menu, Information }
 
 internal class ContextMenuController {
     internal var pendingAnchor: Rect? = null
@@ -73,20 +77,22 @@ internal class ContextMenuController {
     @Composable
     internal fun Register(
         visible: Boolean, anchor: Rect?, onDismiss: () -> Unit, onShowingChanged: (Boolean) -> Unit,
-        header: (@Composable () -> Unit)?, content: @Composable ColumnScope.() -> Unit,
+        header: (@Composable () -> Unit)?, presentation: ContextMenuPresentation, title: String,
+        content: @Composable ColumnScope.() -> Unit,
     ) {
         BackHandler(visible, onBack = onDismiss)
         val owner = remember { Any() }
         val dismiss = rememberUpdatedState(onDismiss)
         val showing = rememberUpdatedState(onShowingChanged)
         val currentHeader = rememberUpdatedState(header)
+        val currentTitle = rememberUpdatedState(title)
         val currentContent = rememberUpdatedState(content)
-        DisposableEffect(visible, anchor) {
+        DisposableEffect(visible, anchor, presentation) {
             if (visible) {
                 // Consume a button's sample once. A submenu keeps the currently presented origin.
                 val origin = anchor ?: pendingAnchor ?: requestState?.takeIf { isShowing || visibleState }?.anchor
                 pendingAnchor = null
-                present(MenuRequest(owner, origin, dismiss, showing, currentHeader, currentContent))
+                present(MenuRequest(owner, origin, dismiss, showing, currentHeader, presentation, currentTitle, currentContent))
             } else hide(owner)
             onDispose { hide(owner) }
         }
@@ -114,11 +120,11 @@ internal class ContextMenuController {
         val backdrop = remember { HazeState() }
         val material = remember {
             HazeStyle(
-                backgroundColor = Color(0xFF28272C),
-                tints = listOf(HazeTint(Color(0xFF28272C).copy(alpha = .72f))),
-                blurRadius = 26.dp,
+                backgroundColor = Color(0xFF242426),
+                tints = listOf(HazeTint(Color(0xFF242426).copy(alpha = .78f))),
+                blurRadius = 28.dp,
                 noiseFactor = 0f,
-                fallbackTint = HazeTint(Color(0xFF28272C).copy(alpha = .98f)),
+                fallbackTint = HazeTint(Color(0xFF242426).copy(alpha = .98f)),
             )
         }
         BoxWithConstraints(Modifier.fillMaxSize()) {
@@ -132,42 +138,52 @@ internal class ContextMenuController {
                 Modifier.clearAndSetSemantics {}.hazeSource(backdrop)
             } else Modifier)) { content() }
             if (present && request != null) {
+                val information = request.presentation == ContextMenuPresentation.Information
                 Box(Modifier.fillMaxSize().graphicsLayer { alpha = progress.value }
-                    .background(Color.Black.copy(alpha = .14f)).clickable(
+                    .background(Color.Black.copy(alpha = if (information) .28f else .12f)).clickable(
                         interactionSource = remember { MutableInteractionSource() }, indication = null,
                         onClickLabel = "关闭菜单", onClick = { request.dismiss.value() },
                     ))
-                val targetWidth = (maxWidth * .68f).coerceIn(240.dp, 360.dp).coerceAtMost(maxWidth - 24.dp)
+                val targetWidth = (if (information) 344.dp else 280.dp).coerceAtMost(maxWidth - 32.dp)
                 val menuWidth = with(density) { targetWidth.toPx() }
                 var measuredHeight by remember { mutableIntStateOf(0) }
                 val pull = remember(request.owner) { Animatable(0f) }
                 val anchor = request.anchor ?: Rect(widthPx - margin, safeTop, widthPx - margin, safeTop + margin)
-                val x = (anchor.right - menuWidth).coerceIn(margin, (widthPx - margin - menuWidth).coerceAtLeast(margin))
+                val x = if (information) (widthPx - menuWidth) / 2f else
+                    (anchor.right - menuWidth).coerceIn(margin, (widthPx - margin - menuWidth).coerceAtLeast(margin))
                 val below = anchor.bottom + margin * .5f
                 val top = if (below + measuredHeight <= safeBottom) below else anchor.top - measuredHeight - margin * .5f
-                val y = top.coerceIn(safeTop, (safeBottom - measuredHeight).coerceAtLeast(safeTop))
-                val pivot = TransformOrigin(((anchor.center.x - x) / menuWidth).coerceIn(0f, 1f),
-                    ((anchor.center.y - y) / measuredHeight.coerceAtLeast(1)).coerceIn(0f, 1f))
-                val shape = RoundedCornerShape(18.dp)
+                val y = if (information) safeTop + (safeBottom - safeTop - measuredHeight).coerceAtLeast(0f) / 2f else
+                    top.coerceIn(safeTop, (safeBottom - measuredHeight).coerceAtLeast(safeTop))
+                val pivot = if (information) TransformOrigin.Center else
+                    TransformOrigin(((anchor.center.x - x) / menuWidth).coerceIn(0f, 1f),
+                        ((anchor.center.y - y) / measuredHeight.coerceAtLeast(1)).coerceIn(0f, 1f))
+                val shape = RoundedCornerShape(if (information) 22.dp else 16.dp)
+                val menuScrollState = key(request.owner, request.presentation, request.title.value) {
+                    rememberScrollState()
+                }
                 Column(Modifier.width(targetWidth)
-                    .heightIn(max = with(density) { (safeBottom - safeTop).coerceAtLeast(100f).toDp() })
+                    .heightIn(max = with(density) {
+                        ((safeBottom - safeTop) * if (information) .86f else .74f).coerceAtLeast(100f).toDp()
+                    })
                     .onSizeChanged { measuredHeight = it.height }
                     .graphicsLayer {
                         val p = progress.value
-                        translationX = x + (anchor.center.x - x - pivot.pivotFractionX * menuWidth) * (1f - p)
-                        translationY = y + (anchor.center.y - y - pivot.pivotFractionY * measuredHeight) * (1f - p) + pull.value
+                        translationX = x + if (information) 0f else
+                            (anchor.center.x - x - pivot.pivotFractionX * menuWidth) * (1f - p)
+                        translationY = y + pull.value + if (information) 0f else
+                            (anchor.center.y - y - pivot.pivotFractionY * measuredHeight) * (1f - p)
                         transformOrigin = pivot
                         scaleX = .94f + .06f * p
                         scaleY = scaleX
                         alpha = p
                         this.shape = shape
-                        shadowElevation = 16.dp.toPx()
+                        shadowElevation = 12.dp.toPx()
                     }
                     .clip(shape).hazeEffect(backdrop, material)
-                    .border(.5.dp, Color.White.copy(alpha = .15f), shape)
                     .menuDismissGesture(pull) { request.dismiss.value() }
                     .pointerInput(Unit) { detectTapGestures {} }
-                    .verticalScroll(rememberScrollState()).semantics { paneTitle = "歌曲菜单" },
+                    .verticalScroll(menuScrollState).semantics { paneTitle = request.title.value },
                 ) {
                     CompositionLocalProvider(LocalInsideContextMenu provides true) {
                         request.header.value?.invoke()
@@ -260,11 +276,16 @@ internal fun AppContextMenu(
     onDismiss: () -> Unit,
     onShowingChanged: (Boolean) -> Unit = {},
     header: (@Composable () -> Unit)? = null,
+    presentation: ContextMenuPresentation = ContextMenuPresentation.Menu,
+    title: String = "歌曲菜单",
     content: @Composable ColumnScope.() -> Unit,
 ) {
     val host = LocalContextMenuController.current
-    if (host != null) host.Register(visible, anchor, onDismiss, onShowingChanged, header, content)
-    else AppSheet(visible, onDismiss, onShowingChanged = onShowingChanged, content = content)
+    if (host != null) host.Register(visible, anchor, onDismiss, onShowingChanged, header, presentation, title, content)
+    else AppSheet(visible, onDismiss, title = title, onShowingChanged = onShowingChanged) {
+        header?.invoke()
+        content()
+    }
 }
 
 /** No snapshot writes while scrolling: anchor bounds are sampled only when opening the menu. */

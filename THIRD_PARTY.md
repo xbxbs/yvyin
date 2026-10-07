@@ -23,6 +23,14 @@
 
 ## 独立资源
 
+本轮浮动导航参照 KernelSU manager 的 `FloatingBottomBar.kt`（commit `e7b071100754b55e28be6930f9967d99adb4a385`）：
+https://github.com/tiann/KernelSU/blob/e7b071100754b55e28be6930f9967d99adb4a385/manager/app/src/main/java/me/weishu/kernelsu/ui/component/FloatingBottomBar.kt
+该文件头说明参考 compose-miuix 的 IosLiquidGlassNavigationBar（Apache-2.0），KernelSU 仓库整体为 GPL-3.0。本应用没有复制其 GPL 辅助类或引入 KernelSU 功能；使用已经存在的 Kyant Backdrop 1.0.0 API，自行实现 `LiquidNavigationMotion.kt`、组合背景采样和触摸指示器，参照64/56dp结构、轻模糊/透镜分层及跟手行为。不是 KernelSU/Apple 官方组件，也不宣称跨依赖像素级相同。
+
+本次源码归档已在 `third_party/jaudiotagger-3.0.1/` 随附该版本未修改的官方源码 JAR、下载校验与替换/重构说明；不随包提供任何私密签名密钥。
+
+- jaudiotagger 3.0.1：`net.jthink:jaudiotagger:3.0.1`，jaudiotagger / Entagged contributors，LGPL-2.1-or-later（已核对该版本 `AudioFileIO.java` 许可头）。用于下载临时音频的封面、歌词与基础标签内嵌；库本身未修改，AndroidArtwork 适配与回读校验位于 `MusicMetadataEmbedder.kt`。许可全文：`app/src/main/assets/licenses/jaudiotagger-LGPL-2.1.txt`。对应上游源码：https://repo.maven.apache.org/maven2/net/jthink/jaudiotagger/3.0.1/jaudiotagger-3.0.1-sources.jar 。发布新版 APK 时须一并提供本项目可重构源码和此版本库源码/许可，保留替换该库重新构建的能力。
+
 - Kyant0 Backdrop 1.0.0：AndroidLiquidGlass 的 Backdrop 液态材质管线，Apache-2.0，https://github.com/Kyant0/AndroidLiquidGlass 。本轮使用其 `drawBackdrop`、`lens`、`vibrancy`、`Highlight` 与 `LayerBackdrop`；普通毛玻璃仍使用 Haze，开关关闭时不运行液态折射。
 
 - Compose Cupertino Android / Core 0.1.0-alpha04：Copyright (c) 2023–2024 Compose Cupertino project and open source contributors，Apache-2.0，https://github.com/alexzhirkevich/compose-cupertino 。应用使用主题与开关等Android控件，不引入 `cupertino-icons-extended`；完整许可位于 `app/src/main/assets/licenses/cupertino-Apache-2.0.txt`。

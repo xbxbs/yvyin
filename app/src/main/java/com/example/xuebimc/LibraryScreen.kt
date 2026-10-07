@@ -165,6 +165,13 @@ private data class LibrarySearchResult(
     val alphabet: Map<Char, Int> = emptyMap(),
 )
 
+private data class LibraryLandingDestination(
+    val label: String,
+    val count: Int?,
+    val icon: PlayerIconType?,
+    val onClick: () -> Unit,
+)
+
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 internal fun LibrarySurface(
@@ -195,6 +202,8 @@ internal fun LibrarySurface(
     onSongs: () -> Unit = {},
     onRootBack: () -> Unit = {},
     onPlaylists: () -> Unit = {},
+    onDownloads: () -> Unit = {},
+    onDeleteTrack: (Track) -> Unit = {},
     playlistCount: Int = 0,
     onAddToPlaylist: (List<Track>) -> Unit = {},
     backdropVisible: Boolean = true,
@@ -324,15 +333,6 @@ internal fun LibrarySurface(
         menuTrack = track
         menuOpen = true
     }
-    fun lyricoIntent(track: Track): Intent? {
-        if (track.isOnline) return null
-        val intent = Intent(Intent.ACTION_EDIT, track.uri).apply {
-            setPackage("com.lonx.lyrico")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION or Intent.FLAG_GRANT_WRITE_URI_PERMISSION)
-            clipData = android.content.ClipData.newRawUri(track.title, track.uri)
-        }
-        return intent.takeIf { it.resolveActivity(context.packageManager) != null }
-    }
     fun showFeedback(message: String) { feedback = ++feedbackRevision to message }
     fun selectFromList(track: Track, queue: List<Track>) {
         if (queue.none { it.stableKey == track.stableKey }) return
@@ -417,6 +417,7 @@ internal fun LibrarySurface(
     // Do not let a tap during debounce play yesterday's filter or a removed collection.
     val visibleTracks = if (searching) emptyList() else searchResult.matches
     val visibleGroups = if (searching) emptyList() else searchResult.groups
+    val homeShell = !showSongsOnly && browseKind == null
     val albumColumns = if (LocalConfiguration.current.screenWidthDp >= 600) 3 else 2
     val currentKey = currentTrack?.stableKey
     val density = LocalDensity.current
@@ -458,13 +459,24 @@ internal fun LibrarySurface(
                     .then(if (sampleBackdrop) Modifier.hazeSource(headerBackdrop,
                         zIndex = if (showSongsOnly) 1f else 0f) else Modifier),
                 // The parent already includes its floating bar + system navigation in bottomInset.
-                // Keep the initial heading below the feather; padding scrolls away, not the viewport.
+                // Home owns its heading/actions in the list. Do not reserve an invisible toolbar.
                 contentPadding = PaddingValues(start = 18.dp,
                     end = if (showSongsOnly && searchResult.alphabet.isNotEmpty() && !searching) 32.dp else 18.dp,
-                    top = topBarHeight + headerFeatherHeight, bottom = bottomInset + 24.dp),
+                    top = if (homeShell) 14.dp else topBarHeight + 12.dp, bottom = bottomInset + 24.dp),
             ) {
                 item(key = "library:heading", contentType = "heading") {
-                    LibraryText(pageTitle, Modifier.padding(top = 2.dp, bottom = 12.dp), size = 34.sp, bold = true, maxLines = 2)
+                    if (homeShell) {
+                        Row(Modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
+                            Column(Modifier.weight(1f)) {
+                                LibraryText(pageTitle, size = 30.sp, semibold = true, maxLines = 2)
+                                LibraryText(if (loading) "正在更新资料库…" else "${tracks.size} 首歌曲",
+                                    Modifier.padding(top = 5.dp, bottom = 18.dp), size = 13.sp, color = LibrarySecondary)
+                            }
+                            LibraryIconButton(LibrarySymbol.More, "资料库选项", {
+                                dismissKeyboard(); menuTrack = null; menuOpen = true
+                            }, color = LibrarySecondary)
+                        }
+                    } else LibraryText(pageTitle, Modifier.padding(top = 2.dp, bottom = 12.dp), size = 30.sp, semibold = true, maxLines = 2)
                 }
                 item(key = "library:search", contentType = "search") {
                     Box(Modifier.fillMaxWidth().padding(bottom = 12.dp)) {
@@ -476,26 +488,49 @@ internal fun LibrarySurface(
                 }
                 if (!showSongsOnly && browseKind == null && searchTerm.isEmpty()) {
                     item(key = "library:browse", contentType = "browse") {
-                        Column {
-                            LibraryDestinationRow("播放列表", playlistCount, PlayerIconType.Queue, onPlaylists)
-                            LibraryBrowseKind.entries.forEach { kind ->
-                                if (kind == LibraryBrowseKind.Folders) LibraryDestinationRow("歌曲", tracks.size, PlayerIconType.Play, onSongs)
-                                LibraryBrowseRow(kind, readyIndex?.groups?.get(kind)?.size, onClick = { browse(kind) })
-                            }
-                        }
+                        LibraryLandingNavigation(listOf(
+                            LibraryLandingDestination("歌曲", tracks.size, PlayerIconType.Play, onSongs),
+                            LibraryLandingDestination("播放列表", playlistCount, PlayerIconType.Queue, onPlaylists),
+                            LibraryLandingDestination("艺人", readyIndex?.groups?.get(LibraryBrowseKind.Artists)?.size,
+                                PlayerIconType.Artist) { browse(LibraryBrowseKind.Artists) },
+                            LibraryLandingDestination("专辑", readyIndex?.groups?.get(LibraryBrowseKind.Albums)?.size,
+                                PlayerIconType.Album) { browse(LibraryBrowseKind.Albums) },
+                            LibraryLandingDestination("文件夹", readyIndex?.groups?.get(LibraryBrowseKind.Folders)?.size,
+                                null) { browse(LibraryBrowseKind.Folders) },
+                            LibraryLandingDestination("下载管理", null, PlayerIconType.Download, onDownloads),
+                        ))
                     }
                 }
                 val recent = readyIndex?.recent.orEmpty()
                 if (!showSongsOnly && browseKind == null && searchTerm.isEmpty() && recent.isNotEmpty()) {
-                    item(key = "library:recent", contentType = "recent") {
-                        val visible by remember(listState) {
-                            derivedStateOf { listState.layoutInfo.visibleItemsInfo.any { it.key == "library:recent" } }
+                    item(key = "library:recent-heading", contentType = "heading") {
+                        Row(Modifier.fillMaxWidth().padding(top = 18.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically) {
+                            LibraryText("最近添加", Modifier.weight(1f), size = 20.sp, semibold = true)
+                            Box(Modifier.heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onSongs)
+                                .padding(start = 16.dp, top = 12.dp, bottom = 12.dp)) {
+                                LibraryText("全部", size = 14.sp, color = LibraryAccent)
+                            }
                         }
-                        LibraryRecentShelf(recent, currentKey, isPlaying, animatePlayback && visible,
-                            onSelect = { selectFromList(it, recent) }, onMore = ::openTrackMenu)
+                    }
+                    items(recent.take(12).chunked(albumColumns), key = { "recent:${it.first().stableKey}" },
+                        contentType = { "recent-covers" }) { row ->
+                        val rowKey = "recent:${row.first().stableKey}"
+                        val visible by remember(listState, rowKey) {
+                            derivedStateOf { listState.layoutInfo.visibleItemsInfo.any { it.key == rowKey } }
+                        }
+                        Row(Modifier.fillMaxWidth().padding(bottom = 22.dp), horizontalArrangement = Arrangement.spacedBy(18.dp)) {
+                            row.forEach { track ->
+                                LibraryRecentTile(track, currentKey, isPlaying, animatePlayback && visible,
+                                    Modifier.weight(1f), onSelect = { selectFromList(track, recent) },
+                                    onMore = { openTrackMenu(track) })
+                            }
+                            repeat(albumColumns - row.size) { Spacer(Modifier.weight(1f)) }
+                        }
                     }
                 }
-                if (!showSongsOnly && browseKind == null && searchTerm.isEmpty()) {
+                if (!showSongsOnly && browseKind == null && searchTerm.isEmpty() &&
+                    (listeningStats.playsByTrack.isNotEmpty() || listeningStats.secondsByDay.isNotEmpty())) {
                     item(key = "library:stats", contentType = "stats") {
                         LibraryStatsSection(listeningStats, tracks)
                     }
@@ -534,7 +569,7 @@ internal fun LibrarySurface(
                             size = 13.sp, color = LibrarySecondary,
                         )
                         if (sort == LibrarySort.Recent && !browsingGroups) {
-                            LibraryText("按媒体库编号估算；导入文件保留原序", Modifier.padding(top = 4.dp), size = 12.sp,
+                            LibraryText("按真实添加时间排列；未知时间的旧文件排在最后", Modifier.padding(top = 4.dp), size = 12.sp,
                                 color = LibrarySecondary, maxLines = 2)
                         }
                         if (!browsingGroups && visibleTracks.isNotEmpty() && !searching) {
@@ -593,20 +628,25 @@ internal fun LibrarySurface(
                             isPlaying = isPlaying && track.stableKey == currentKey,
                             animateBars = animatePlayback && visible,
                             onSelect = { selectFromList(it, visibleTracks) }, onMore = { openTrackMenu(track) },
+                            onDelete = { onDeleteTrack(track) }, swipeEnabled = isActive && !track.isOnline,
+                            motionAllowed = motionAllowed,
                         )
                     }
                 }
                 }
             }
+            if (!homeShell || barAlpha > .001f) {
             MusicHeaderGlass(
                 backdrop = headerBackdrop,
                 // Only the toolbar owns an overlay; search scrolls and clips with its row.
                 headerHeight = topBarHeight,
                 featherHeight = headerFeatherHeight,
                 enabled = sampleBackdrop,
+                modifier = Modifier.graphicsLayer { alpha = if (homeShell) barAlpha else 1f },
             )
             Row(
                 Modifier.fillMaxWidth().heightIn(min = 56.dp)
+                    .graphicsLayer { alpha = if (homeShell) barAlpha else 1f }
                     .onSizeChanged { topBarHeight = with(density) { it.height.toDp() } }
                     .pointerInput(Unit) { detectTapGestures {} }
                     .padding(horizontal = 10.dp),
@@ -627,6 +667,7 @@ internal fun LibrarySurface(
                     menuTrack = null
                     menuOpen = true
                 }, color = LibrarySecondary)
+            }
             }
             if (showSongsOnly && !browsingGroups && !searching && !searchFocused &&
                 searchResult.alphabet.isNotEmpty() && isActive && !sheetShowing) {
@@ -665,6 +706,8 @@ internal fun LibrarySurface(
                 SheetActionGroup {
                     SheetActionRow("导入音乐") { menuOpen = false; onImport() }
                     SheetActionDivider()
+                    SheetActionRow("下载管理", PlayerIconType.Download) { menuOpen = false; onDownloads() }
+                    SheetActionDivider()
                     if (loading) {
                         LibraryText("正在扫描…", Modifier.fillMaxWidth().heightIn(min = 52.dp).padding(16.dp)
                             .semantics { progressBarRangeInfo = ProgressBarRangeInfo.Indeterminate }, color = LibrarySecondary)
@@ -687,17 +730,10 @@ internal fun LibrarySurface(
                         }
                     }
                 }
-                LibraryText("最近添加按媒体库编号估算；导入文件暂无添加时间。", Modifier.padding(16.dp),
+                LibraryText("最近添加使用系统或实际导入时间；旧文件时间未知时不会冒充新歌。", Modifier.padding(16.dp),
                     size = 12.sp, color = LibrarySecondary, maxLines = 3)
             } else if (selectedTrack != null) {
-                Row(Modifier.fillMaxWidth().padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
-                    TrackArtwork(selectedTrack, Modifier.size(48.dp).clip(RoundedCornerShape(8.dp)).clearAndSetSemantics {}, requestSize = 160)
-                    Spacer(Modifier.width(12.dp))
-                    Column(Modifier.weight(1f)) {
-                        LibraryText(libraryTitle(selectedTrack), size = 17.sp, semibold = true, maxLines = 2)
-                        LibraryText(librarySubtitle(selectedTrack), Modifier.padding(top = 2.dp), size = 13.sp, color = LibrarySecondary, maxLines = 2)
-                    }
-                }
+                SheetTrackHeader(selectedTrack)
                 SheetActionDivider()
                 SheetActionGroup {
                     SheetActionRow("下一首播放", PlayerIconType.Next) {
@@ -716,11 +752,10 @@ internal fun LibrarySurface(
                         menuOpen = false
                         onAddToPlaylist(listOf(selectedTrack))
                     }
-                    lyricoIntent(selectedTrack)?.let { editIntent ->
+                    if (!selectedTrack.isOnline) {
                         SheetActionDivider()
                         SheetActionRow("编辑元数据", PlayerIconType.Info) {
-                            runCatching { context.startActivity(editIntent) }
-                                .onFailure { showFeedback("无法打开 Lyrico") }
+                            MetadataEditor.open(context, selectedTrack)?.let(::showFeedback)
                             menuOpen = false
                         }
                     }
@@ -730,6 +765,17 @@ internal fun LibrarySurface(
                     SheetActionRow("前往专辑", PlayerIconType.Album) { browse(LibraryBrowseKind.Albums, libraryAlbumKey(selectedTrack)) }
                     SheetActionDivider()
                     SheetActionRow("前往艺人", PlayerIconType.Artist) { browse(LibraryBrowseKind.Artists, libraryArtistKey(selectedTrack)) }
+                }
+                SheetActionSectionDivider()
+                SheetActionGroup {
+                    SheetActionRow("分享歌曲", PlayerIconType.Share) {
+                        menuOpen = false
+                        shareLibraryTrack(context, selectedTrack)?.let(::showFeedback)
+                    }
+                    if (!selectedTrack.isOnline) {
+                        SheetActionDivider()
+                        SheetActionRow("删除歌曲…") { menuOpen = false; onDeleteTrack(selectedTrack) }
+                    }
                 }
             } else {
                 LibraryText("这首歌曲已移出资料库", maxLines = 2)
@@ -773,38 +819,33 @@ private fun LibraryStat(label: String, value: String, modifier: Modifier) {
 }
 
 @Composable
-private fun LibraryDestinationRow(label: String, count: Int, icon: PlayerIconType, onClick: () -> Unit) {
-    Column {
-        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable(role = Role.Button, onClick = onClick)
-            .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            PlayerIcon(icon, Modifier.size(24.dp), LibraryAccent)
-            Spacer(Modifier.width(16.dp))
-            LibraryText(label, Modifier.weight(1f), size = 20.sp, semibold = true)
-            LibraryText(count.toString(), size = 14.sp, color = LibrarySecondary)
-            Spacer(Modifier.width(12.dp))
-            LibraryGlyph(LibrarySymbol.Chevron, Modifier.size(16.dp), LibrarySecondary)
+private fun LibraryLandingNavigation(destinations: List<LibraryLandingDestination>) {
+    val config = LocalConfiguration.current
+    val columns = if (config.fontScale > 1.25f || config.screenWidthDp < 340) 1 else 2
+    Column(Modifier.fillMaxWidth().padding(top = 2.dp)) {
+        destinations.chunked(columns).forEachIndexed { index, row ->
+            if (index > 0) Box(Modifier.fillMaxWidth().height(.5.dp).background(LibraryHairline.copy(alpha = .07f)))
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(20.dp)) {
+                row.forEach { destination ->
+                    val interaction = remember(destination.label) { MutableInteractionSource() }
+                    val pressed by interaction.collectIsPressedAsState()
+                    Row(Modifier.weight(1f).heightIn(min = 54.dp).clip(RoundedCornerShape(8.dp))
+                        .background(if (pressed) Color.White.copy(alpha = .07f) else Color.Transparent)
+                        .clickable(interactionSource = interaction, indication = null, role = Role.Button,
+                            onClick = destination.onClick).padding(vertical = 12.dp, horizontal = 2.dp),
+                        verticalAlignment = Alignment.CenterVertically) {
+                        if (destination.icon != null) PlayerIcon(destination.icon, Modifier.size(20.dp), LibraryAccent)
+                        else LibraryGlyph(LibrarySymbol.Folder, Modifier.size(20.dp), LibraryAccent)
+                        Spacer(Modifier.width(10.dp))
+                        LibraryText(destination.label, Modifier.weight(1f), size = 16.sp, maxLines = 2)
+                        destination.count?.let { count ->
+                            LibraryText(count.toString(), Modifier.padding(start = 6.dp), size = 12.sp, color = LibrarySecondary)
+                        }
+                    }
+                }
+                repeat(columns - row.size) { Spacer(Modifier.weight(1f)) }
+            }
         }
-        Box(Modifier.padding(start = 40.dp).fillMaxWidth().height(.5.dp).background(LibraryHairline))
-    }
-}
-
-@Composable
-private fun LibraryBrowseRow(kind: LibraryBrowseKind, count: Int?, onClick: () -> Unit) {
-    Column {
-        Row(Modifier.fillMaxWidth().heightIn(min = 56.dp).clickable(role = Role.Button, onClick = onClick)
-            .padding(vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
-            LibraryGlyph(when (kind) {
-                LibraryBrowseKind.Artists -> LibrarySymbol.Artist
-                LibraryBrowseKind.Albums -> LibrarySymbol.Album
-                LibraryBrowseKind.Folders -> LibrarySymbol.Folder
-            }, Modifier.size(24.dp), LibraryAccent)
-            Spacer(Modifier.width(16.dp))
-            LibraryText(kind.label, Modifier.weight(1f), size = 20.sp, semibold = true)
-            if (count != null) LibraryText(count.toString(), size = 14.sp, color = LibrarySecondary)
-            Spacer(Modifier.width(12.dp))
-            LibraryGlyph(LibrarySymbol.Chevron, Modifier.size(16.dp), LibrarySecondary)
-        }
-        Box(Modifier.padding(start = 40.dp).fillMaxWidth().height(.5.dp).background(LibraryHairline))
     }
 }
 
@@ -842,61 +883,31 @@ private fun LibraryAlbumTile(group: LibraryBrowseGroup, modifier: Modifier, onCl
 
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
-private fun LibraryRecentShelf(
-    tracks: List<Track>, currentKey: String?, isPlaying: Boolean, animateBars: Boolean,
-    onSelect: (Track) -> Unit, onMore: (Track) -> Unit,
+private fun LibraryRecentTile(
+    track: Track, currentKey: String?, isPlaying: Boolean, animateBars: Boolean,
+    modifier: Modifier, onSelect: () -> Unit, onMore: () -> Unit,
 ) {
-    val shelfState = rememberLazyListState()
-    Column(Modifier.padding(top = 26.dp)) {
-        LibraryText("最近添加", size = 20.sp, semibold = true)
-        LibraryText("按媒体库编号估算", Modifier.padding(top = 4.dp), size = 12.sp, color = LibrarySecondary)
-        Spacer(Modifier.height(12.dp))
-        LazyRow(
-            state = shelfState,
-            // Bleed to the screen edge while the first cover stays on the content margin.
-            modifier = Modifier.layout { measurable, constraints ->
-                val bleed = 18.dp.roundToPx()
-                val placeable = measurable.measure(constraints.copy(maxWidth = constraints.maxWidth + bleed * 2))
-                layout(constraints.maxWidth, placeable.height) { placeable.place(-bleed, 0) }
-            },
-            contentPadding = PaddingValues(horizontal = 18.dp),
-            horizontalArrangement = Arrangement.spacedBy(14.dp),
-        ) {
-            items(tracks, key = { it.stableKey }) { track ->
-                val visible by remember(shelfState, track.stableKey) {
-                    derivedStateOf { shelfState.layoutInfo.visibleItemsInfo.any { it.key == track.stableKey } }
-                }
-                Column(
-                    Modifier.width(148.dp).clip(RoundedCornerShape(10.dp))
-                        .combinedClickable(role = Role.Button, onClickLabel = "播放歌曲", onLongClickLabel = "歌曲操作",
-                            onLongClick = { onMore(track) }, onClick = { onSelect(track) })
-                        .semantics {
-                            selected = track.stableKey == currentKey
-                            if (track.stableKey == currentKey) stateDescription = if (isPlaying) "正在播放" else "已暂停"
-                        },
-                ) {
-                    Box {
-                        TrackArtwork(
-                            track, Modifier.size(148.dp).clip(RoundedCornerShape(10.dp)).clearAndSetSemantics {},
-                            requestSize = 360,
-                        )
-                        if (track.stableKey == currentKey) {
-                            Box(
-                                Modifier.align(Alignment.BottomEnd).padding(8.dp).size(26.dp).clip(CircleShape)
-                                    .background(Color(0xFF332C39).copy(alpha = .9f)),
-                                contentAlignment = Alignment.Center,
-                            ) {
-                                if (isPlaying) LibraryEqualizer(animateBars && visible, Modifier.size(14.dp))
-                                else LibraryGlyph(LibrarySymbol.Pause, Modifier.size(14.dp), LibraryAccent)
-                            }
-                        }
-                    }
-                    LibraryText(libraryTitle(track), Modifier.padding(top = 8.dp), size = 14.sp, medium = true,
-                        color = if (track.stableKey == currentKey) LibraryAccent else Color.White)
-                    LibraryText(librarySubtitle(track), Modifier.padding(top = 3.dp), size = 13.sp, color = LibrarySecondary)
-                }
+    val anchor = rememberMenuAnchor()
+    Column(modifier.then(anchor.first).clip(RoundedCornerShape(10.dp))
+        .combinedClickable(role = Role.Button, onClickLabel = "播放歌曲", onLongClickLabel = "歌曲操作",
+            onLongClick = { anchor.second(); onMore() }, onClick = onSelect)
+        .semantics {
+            selected = track.stableKey == currentKey
+            if (track.stableKey == currentKey) stateDescription = if (isPlaying) "正在播放" else "已暂停"
+        }) {
+        Box {
+            TrackArtwork(track, Modifier.fillMaxWidth().aspectRatio(1f).clip(RoundedCornerShape(10.dp))
+                .clearAndSetSemantics {}, requestSize = 480)
+            if (track.stableKey == currentKey) Box(Modifier.align(Alignment.BottomEnd)
+                .padding(9.dp).size(28.dp).clip(CircleShape).background(Color.Black.copy(alpha = .72f)),
+                contentAlignment = Alignment.Center) {
+                if (isPlaying) LibraryEqualizer(animateBars, Modifier.size(15.dp))
+                else LibraryGlyph(LibrarySymbol.Pause, Modifier.size(15.dp), Color.White)
             }
         }
+        LibraryText(libraryTitle(track), Modifier.padding(top = 9.dp), size = 16.sp, maxLines = 2)
+        LibraryText(track.artist.ifBlank { "未知艺人" }, Modifier.padding(top = 3.dp), size = 14.sp,
+            color = LibrarySecondary, maxLines = 1)
     }
 }
 
@@ -919,7 +930,7 @@ private fun LibrarySearchField(
         BasicTextField(
             value = query,
             onValueChange = onQueryChange,
-            modifier = Modifier.weight(1f).heightIn(min = 36.dp).onFocusChanged { onFocusChange(it.isFocused) }
+            modifier = Modifier.weight(1f).heightIn(min = 48.dp).onFocusChanged { onFocusChange(it.isFocused) }
                 .semantics { contentDescription = "搜索本地音乐" },
             textStyle = TextStyle(
                 color = Color.White, fontSize = 16.sp, fontFamily = PlayerTypography.familyFor(query),
@@ -933,7 +944,7 @@ private fun LibrarySearchField(
                 focus.clearFocus()
             }),
             decorationBox = { field ->
-                Box(Modifier.heightIn(min = 36.dp).padding(vertical = 6.dp), contentAlignment = Alignment.CenterStart) {
+                Box(Modifier.heightIn(min = 48.dp).padding(vertical = 6.dp), contentAlignment = Alignment.CenterStart) {
                     if (query.isEmpty()) {
                         LibraryText("搜索歌曲、艺人或专辑", size = 15.sp, color = LibrarySecondary)
                     }
@@ -942,7 +953,7 @@ private fun LibrarySearchField(
             },
         )
         if (query.isNotEmpty()) {
-            Box(Modifier.size(36.dp).clickable(role = Role.Button, onClickLabel = "清除搜索", onClick = { onQueryChange("") })
+            Box(Modifier.size(48.dp).clickable(role = Role.Button, onClickLabel = "清除搜索", onClick = { onQueryChange("") })
                 .semantics { contentDescription = "清除搜索" }, contentAlignment = Alignment.Center) {
                 Box(Modifier.size(18.dp).clip(CircleShape).background(LibrarySecondary), contentAlignment = Alignment.Center) {
                     LibraryGlyph(LibrarySymbol.Clear, Modifier.size(14.dp), LibraryGround)
@@ -954,7 +965,7 @@ private fun LibrarySearchField(
       }
       if (focused || query.isNotEmpty()) {
           Spacer(Modifier.width(8.dp))
-          Box(Modifier.widthIn(min = 48.dp).heightIn(min = 36.dp).clickable(role = Role.Button, onClick = onCancel)
+          Box(Modifier.widthIn(min = 48.dp).heightIn(min = 48.dp).clickable(role = Role.Button, onClick = onCancel)
               .padding(horizontal = 8.dp, vertical = 6.dp), contentAlignment = Alignment.Center) {
               LibraryText("取消", size = 16.sp, color = LibraryAccent, medium = true)
           }
@@ -967,9 +978,18 @@ private fun LibrarySearchField(
 private fun LibraryTrackRow(
     track: Track, isCurrent: Boolean, isPlaying: Boolean, animateBars: Boolean,
     onSelect: (Track) -> Unit, onMore: () -> Unit,
+    onDelete: () -> Unit, swipeEnabled: Boolean, motionAllowed: Boolean,
 ) {
     val longPressAnchor = rememberMenuAnchor()
-    Column {
+    val swipeScope = rememberCoroutineScope()
+    val swipe = remember(track.stableKey) { QueueSwipeState(swipeScope) }
+    LaunchedEffect(swipeEnabled) { if (!swipeEnabled) swipe.reset(false) }
+    Box(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp))) {
+        Box(Modifier.matchParentSize().background(Color(0xFFB92D3D)), contentAlignment = Alignment.CenterEnd) {
+            LibraryText("删除…", Modifier.padding(horizontal = 22.dp), size = 16.sp, medium = true)
+        }
+    Column(Modifier.fillMaxWidth().graphicsLayer { translationX = swipe.offset }
+        .background(LibraryGround).queueSwipeToRemove(track.stableKey, swipeEnabled, swipe, motionAllowed, onDelete)) {
         Row(
             Modifier.fillMaxWidth().then(longPressAnchor.first).clip(RoundedCornerShape(10.dp))
                 .combinedClickable(role = Role.Button, onClickLabel = "播放歌曲", onLongClickLabel = "歌曲操作",
@@ -1015,6 +1035,7 @@ private fun LibraryTrackRow(
             LibraryIconButton(LibrarySymbol.More, "${libraryTitle(track)}的更多操作", onMore, color = LibrarySecondary)
         }
         Box(Modifier.padding(start = 60.dp).fillMaxWidth().height(.5.dp).background(LibraryHairline))
+    }
     }
 }
 

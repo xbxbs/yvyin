@@ -42,7 +42,11 @@ class PlaybackService : Service() {
     // Song cover for the notification / lock screen (embedded art is not reachable by URI).
     private val artworkScope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private var artworkJob: Job? = null
-    private var artworkKey: String? = null
+    private data class ArtworkIdentity(val stableKey: String, val uri: String?, val metadataRevision: String)
+    private fun artworkIdentity(track: Track) = ArtworkIdentity(
+        track.stableKey, track.artworkUri?.toString(), track.metadataRevision,
+    )
+    private var artworkKey: ArtworkIdentity? = null
     private var artwork: android.graphics.Bitmap? = null
     private val repository by lazy { LocalMusicRepository(applicationContext) }
     // Keep notification/Binder work out of the transport click / decoder callback stack.
@@ -195,9 +199,9 @@ class PlaybackService : Service() {
                 metadata.putString(MediaMetadata.METADATA_KEY_ART_URI, it.toString())
                 metadata.putString(MediaMetadata.METADATA_KEY_DISPLAY_ICON_URI, it.toString())
             }
-            if (artworkKey == track.stableKey) artwork?.let { metadata.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) }
+            if (artworkKey == artworkIdentity(track)) artwork?.let { metadata.putBitmap(MediaMetadata.METADATA_KEY_ALBUM_ART, it) }
             session.setMetadata(metadata.build())
-            if (artworkKey != track.stableKey) loadArtwork(track)
+            if (artworkKey != artworkIdentity(track)) loadArtwork(track)
             publishedTrack = track
             publishedDuration = controller.durationMs
         }
@@ -214,7 +218,8 @@ class PlaybackService : Service() {
 
     private fun loadArtwork(track: Track) {
         artworkJob?.cancel()
-        artworkKey = track.stableKey
+        val requestedKey = artworkIdentity(track)
+        artworkKey = requestedKey
         artwork = null
         artworkJob = artworkScope.launch {
             val bitmap = try {
@@ -224,7 +229,7 @@ class PlaybackService : Service() {
             } catch (_: Exception) {
                 null
             }
-            if (stopping || artworkKey != track.stableKey) return@launch
+            if (stopping || artworkKey != requestedKey) return@launch
             artwork = bitmap
             publishedTrack = null // republish metadata with the cover
             scheduleRefresh()
@@ -269,7 +274,7 @@ class PlaybackService : Service() {
         return notificationBuilder()
             .setContentTitle(track.title.ifBlank { track.displayName.ifBlank { "未知歌曲" } })
             .setContentText(track.artist.ifBlank { track.album })
-            .apply { if (artworkKey == track.stableKey) artwork?.let { setLargeIcon(it) } }
+            .apply { if (artworkKey == artworkIdentity(track)) artwork?.let { setLargeIcon(it) } }
             .setSubText(controller.error ?: if (!controller.ready && controller.playbackRequested) "准备播放" else null)
             .setOngoing(wantsPlayback)
             .setDeleteIntent(actionIntent(ACTION_STOP, 4))

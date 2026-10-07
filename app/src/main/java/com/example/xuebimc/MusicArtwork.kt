@@ -263,6 +263,7 @@ private data class ArtworkKey(
     val stableKey: String,
     val artworkUri: String?,
     val size: Int,
+    val metadataRevision: String,
 )
 
 private data class CachedArtwork(
@@ -278,6 +279,7 @@ private fun rememberMusicArtwork(track: Track?, requestSize: Int): CachedArtwork
     val context = LocalContext.current.applicationContext
     val stableKey = track?.stableKey
     val artworkUri = track?.artworkUri?.toString()
+    val metadataRevision = track?.metadataRevision.orEmpty()
     val size = when {
         requestSize <= 64 -> 64
         requestSize <= 128 -> 128
@@ -285,8 +287,8 @@ private fun rememberMusicArtwork(track: Track?, requestSize: Int): CachedArtwork
         else -> 512
     }
     // Playback headers/URLs do not identify artwork and are never sent to the image host.
-    val key = remember(stableKey, artworkUri, size) {
-        stableKey?.let { ArtworkKey(it, artworkUri, size) }
+    val key = remember(stableKey, artworkUri, size, metadataRevision) {
+        stableKey?.let { ArtworkKey(it, artworkUri, size, metadataRevision) }
     }
     // A new URI gets fresh state immediately; a previous track's art never flashes here.
     val artwork = remember(key) { mutableStateOf(key?.let(MusicArtworkCache::peek)) }

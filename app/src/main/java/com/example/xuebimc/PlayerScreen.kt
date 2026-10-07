@@ -15,6 +15,7 @@ import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.interaction.collectIsPressedAsState
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -67,6 +68,7 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.progressBarRangeInfo
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.semantics.setProgress
+import androidx.compose.ui.semantics.stateDescription
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.font.FontSynthesis
@@ -109,6 +111,9 @@ fun PlayerScreen(
     onDismissRelease: (Float) -> Unit = {},
     onDismissCancel: () -> Unit = {},
     queueVisible: Boolean = false,
+    queueShuffled: Boolean = false,
+    queueRepeatMode: RepeatMode = RepeatMode.Off,
+    queueAutoplayEnabled: Boolean = false,
     queueContent: @Composable (Modifier, Float) -> Unit = { _, _ -> },
     onQuality: () -> Unit = {},
     playbackItemKey: String? = track?.stableKey,
@@ -118,6 +123,34 @@ fun PlayerScreen(
         track?.audioQuality
     }
     val qualityLabel = audioQuality?.badgeLabel
+    // Playback changes only the rendered cover: its layout, title and control anchors stay put.
+    // animateFloatAsState retains the live spring velocity when play/pause is interrupted.
+    val coverPlayback = animateFloatAsState(
+        targetValue = if (isPlaying) 1f else 0f,
+        animationSpec = spring(dampingRatio = .95f, stiffness = 240f),
+        label = "cover-playback",
+    )
+    val artworkInFlight = sharedArtworkInFlight()
+    val queueModeIcons = remember(queueShuffled, queueRepeatMode, queueAutoplayEnabled) {
+        if (queueAutoplayEnabled) listOf(PlayerIconType.Infinity) else buildList {
+            if (queueShuffled) add(PlayerIconType.Shuffle)
+            when (queueRepeatMode) {
+                RepeatMode.Off -> Unit
+                RepeatMode.All -> add(PlayerIconType.Repeat)
+                RepeatMode.One -> add(PlayerIconType.RepeatOne)
+            }
+        }
+    }
+    val queueModeDescription = remember(queueShuffled, queueRepeatMode, queueAutoplayEnabled) {
+        if (queueAutoplayEnabled) "自动续播已开启" else buildList {
+            add(if (queueShuffled) "随机播放" else "顺序播放")
+            when (queueRepeatMode) {
+                RepeatMode.Off -> add("循环已关闭")
+                RepeatMode.All -> add("全部循环")
+                RepeatMode.One -> add("单曲循环")
+            }
+        }.joinToString("，")
+    }
     val detailVisible = lyricsVisible || queueVisible
     val showLyrics = lyricsVisible && !queueVisible
     // Shared geometry and queue opacity: x = detail, y = queue. The original
@@ -200,6 +233,7 @@ fun PlayerScreen(
         onRevealControls = onRevealControls,
     )
     val marqueeEnabled = (rememberCoroutineScope().coroutineContext[MotionDurationScale]?.scaleFactor ?: 1f) > 0f
+    val presentation = PlayerTrackPresentation(playbackItemKey, track, title, artist)
     BoxWithConstraints(
         Modifier.fillMaxSize().sharedArtworkPlayerViewport().background(Color(0xFF241F2C))
             .pointerInput(showLyrics, seekGestureGuard) {
@@ -245,33 +279,51 @@ fun PlayerScreen(
         ) {
             Box(Modifier.size(pageWidth * .145f, 5.dp).clip(CircleShape).background(Color.White.copy(alpha = .35f)))
         }
-        TrackArtwork(
-            track,
-            Modifier.size(fullCoverSize).graphicsLayer {
+        PlayerTrackChange(
+            presentation, contentKey = { it.key },
+            modifier = Modifier.size(fullCoverSize).graphicsLayer {
                 val progress = transition.value.x.coerceIn(0f, 1f)
                 alpha = (1f - 2f * transition.value.y).coerceIn(0f, 1f)
-                val coverScale = 1f + (compactCoverSize / fullCoverSize - 1f) * progress
+                val geometryScale = 1f + (compactCoverSize / fullCoverSize - 1f) * progress
+                val playbackScale = 1f + (coverPlaybackScale(coverPlayback.value) - 1f) * (1f - progress)
+                val coverScale = geometryScale * playbackScale
+                val playbackInset = fullCoverSize * geometryScale * (1f - playbackScale) / 2f
                 val startX = (pageWidth - fullCoverSize) / 2
                 transformOrigin = TransformOrigin(0f, 0f)
-                translationX = (startX + (pageWidth * .089f - startX) * progress).toPx()
-                translationY = (pageHeight * (.138f - .056f * progress)).toPx()
+                translationX = (startX + (pageWidth * .089f - startX) * progress + playbackInset).toPx()
+                translationY = (pageHeight * (.138f - .056f * progress) + playbackInset).toPx()
                 scaleX = coverScale
                 scaleY = coverScale
                 val compactRadius = designSize(7f)
                 shape = RoundedCornerShape((9.dp + (compactRadius - 9.dp) * progress) / coverScale)
+                shadowElevation = if (artworkInFlight()) 0f else
+                    coverShadowElevation(coverPlayback.value).dp.toPx() * (1f - progress)
+                ambientShadowColor = Color.Black.copy(alpha = .24f)
+                spotShadowColor = Color.Black.copy(alpha = .36f)
                 clip = true
             }.sharedPlayerArtwork(
                 track = track,
-                fullBounds = with(density) {
-                    Rect(
-                        Offset(((pageWidth - fullCoverSize) / 2f).toPx(), (pageHeight * .138f).toPx()),
-                        Size(fullCoverSize.toPx(), fullCoverSize.toPx()),
-                    )
+                fullBounds = {
+                    with(density) {
+                        val scale = coverPlaybackScale(coverPlayback.value)
+                        val inset = fullCoverSize * (1f - scale) / 2f
+                        Rect(
+                            Offset(((pageWidth - fullCoverSize) / 2f + inset).toPx(), (pageHeight * .138f + inset).toPx()),
+                            Size((fullCoverSize * scale).toPx(), (fullCoverSize * scale).toPx()),
+                        )
+                    }
+                },
+                shadowElevationPx = {
+                    with(density) {
+                        coverShadowElevation(coverPlayback.value).dp.toPx() * coverPlaybackScale(coverPlayback.value)
+                    }
                 },
                 enabled = !detailVisible && fullCoverAtRest,
             ).then(if (queueVisible) Modifier.clearAndSetSemantics { } else Modifier),
-            requestSize = 512,
-        )
+            label = "player-cover-song-change",
+        ) { displayed ->
+            TrackArtwork(displayed.track, Modifier.fillMaxSize(), requestSize = 512)
+        }
         // Keep the title clear of the favourite / more controls during the compact transition.
         // Long titles still marquee; they must never run underneath a tappable button.
         val titleWidth = pageWidth * .59f
@@ -284,9 +336,9 @@ fun PlayerScreen(
             platformStyle = PlatformTextStyle(includeFontPadding = false),
             letterSpacing = designText(-.25f), lineHeight = designText(25f)
         )
-        BasicText(
-            title,
-            Modifier.width(titleWidth).graphicsLayer {
+        PlayerTrackChange(
+            presentation, contentKey = { it.key },
+            modifier = Modifier.width(titleWidth).graphicsLayer {
                 val progress = transition.value.x.coerceIn(0f, 1f)
                 transformOrigin = TransformOrigin(0f, 0f)
                 translationX = (pageWidth * (.067f + .243f * progress)).toPx()
@@ -294,16 +346,26 @@ fun PlayerScreen(
                 scaleX = 1f + (16f / baseTitleSize - 1f) * progress
                 scaleY = scaleX
                 alpha = mainChrome.value.coerceIn(0f, 1f) * (1f - 2f * transition.value.y).coerceIn(0f, 1f)
-            }.then(
-                if (marqueeEnabled && !detailVisible) Modifier.basicMarquee(iterations = Int.MAX_VALUE)
-                else Modifier
-            ).then(if (detailVisible) Modifier.clearAndSetSemantics { } else Modifier),
-            style = titleStyle, maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis
-        )
+            }.then(if (detailVisible) Modifier.clearAndSetSemantics { } else Modifier),
+            label = "player-title-song-change",
+        ) { displayed ->
+            BasicText(
+                displayed.title,
+                Modifier.width(titleWidth).then(
+                    if (marqueeEnabled && !detailVisible) Modifier.basicMarquee(iterations = Int.MAX_VALUE)
+                    else Modifier
+                ),
+                style = titleStyle.copy(
+                    fontSize = designText(if (PlayerTypography.isChinese(displayed.title)) 18.5f else 20.5f),
+                    fontFamily = PlayerTypography.familyFor(displayed.title, medium = true),
+                ),
+                maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+            )
+        }
         val artistSize = if (PlayerTypography.isChinese(artist)) 18f else 20f
-        BasicText(
-            artist,
-            Modifier.width(titleWidth).graphicsLayer {
+        PlayerTrackChange(
+            presentation, contentKey = { it.key },
+            modifier = Modifier.width(titleWidth).graphicsLayer {
                 val progress = transition.value.x.coerceIn(0f, 1f)
                 transformOrigin = TransformOrigin(0f, 0f)
                 translationX = (pageWidth * (.067f + .243f * progress)).toPx()
@@ -314,47 +376,58 @@ fun PlayerScreen(
                 scaleY = scaleX
                 alpha = .49f * mainChrome.value.coerceIn(0f, 1f) * (1f - 2f * transition.value.y).coerceIn(0f, 1f)
             }.then(if (detailVisible) Modifier.clearAndSetSemantics { } else Modifier),
-            style = TextStyle(
-                color = Color.White, fontSize = designText(artistSize), lineHeight = designText(25f),
-                fontFamily = PlayerTypography.familyFor(artist), fontWeight = FontWeight.Normal,
-                fontSynthesis = FontSynthesis.None, platformStyle = PlatformTextStyle(includeFontPadding = false)
-            ),
-            maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis
-        )
+            label = "player-artist-song-change",
+        ) { displayed ->
+            BasicText(
+                displayed.artist, Modifier.width(titleWidth),
+                style = TextStyle(
+                    color = Color.White,
+                    fontSize = designText(if (PlayerTypography.isChinese(displayed.artist)) 18f else 20f),
+                    lineHeight = designText(25f),
+                    fontFamily = PlayerTypography.familyFor(displayed.artist), fontWeight = FontWeight.Normal,
+                    fontSynthesis = FontSynthesis.None, platformStyle = PlatformTextStyle(includeFontPadding = false)
+                ),
+                maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis,
+            )
+        }
         if (showLyrics || compactMounted) {
-            Column(
-                Modifier.offset(
+            PlayerTrackChange(
+                presentation, contentKey = { it.key },
+                modifier = Modifier.offset(
                     x = pageWidth * .255f,
                     y = compactTop + (compactCoverSize - designSize(44f)) / 2f
                 ).width(pageWidth * .485f).graphicsLayer {
                     alpha = compactChrome.value.coerceIn(0f, 1f) *
                         (1f - 2f * transition.value.y).coerceIn(0f, 1f)
                     translationY = designSize(6f).toPx() * (1f - alpha)
-                }.then(if (!showLyrics) Modifier.clearAndSetSemantics { } else Modifier)
-            ) {
-                BasicText(
-                    title,
-                    modifier = if (marqueeEnabled && showLyrics) Modifier.basicMarquee(iterations = Int.MAX_VALUE) else Modifier,
-                    style = TextStyle(
-                        color = Color.White.copy(alpha = .94f),
-                        fontSize = designText(17f), lineHeight = designText(22f),
-                        fontFamily = PlayerTypography.familyFor(title),
-                        fontSynthesis = FontSynthesis.None,
-                        platformStyle = PlatformTextStyle(includeFontPadding = false)
-                    ),
-                    maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis
-                )
-                BasicText(
-                    artist,
-                    style = TextStyle(
-                        color = Color.White.copy(alpha = .56f),
-                        fontSize = designText(17f), lineHeight = designText(22f),
-                        fontFamily = PlayerTypography.familyFor(artist),
-                        fontSynthesis = FontSynthesis.None,
-                        platformStyle = PlatformTextStyle(includeFontPadding = false)
-                    ),
-                    maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis
-                )
+                }.then(if (!showLyrics) Modifier.clearAndSetSemantics { } else Modifier),
+                label = "player-compact-song-change",
+            ) { displayed ->
+                Column {
+                    BasicText(
+                        displayed.title,
+                        modifier = if (marqueeEnabled && showLyrics) Modifier.basicMarquee(iterations = Int.MAX_VALUE) else Modifier,
+                        style = TextStyle(
+                            color = Color.White.copy(alpha = .94f),
+                            fontSize = designText(17f), lineHeight = designText(22f),
+                            fontFamily = PlayerTypography.familyFor(displayed.title),
+                            fontSynthesis = FontSynthesis.None,
+                            platformStyle = PlatformTextStyle(includeFontPadding = false)
+                        ),
+                        maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis
+                    )
+                    BasicText(
+                        displayed.artist,
+                        style = TextStyle(
+                            color = Color.White.copy(alpha = .56f),
+                            fontSize = designText(17f), lineHeight = designText(22f),
+                            fontFamily = PlayerTypography.familyFor(displayed.artist),
+                            fontSynthesis = FontSynthesis.None,
+                            platformStyle = PlatformTextStyle(includeFontPadding = false)
+                        ),
+                        maxLines = 1, softWrap = false, overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
         }
         PlayerButton(
@@ -365,7 +438,8 @@ fun PlayerScreen(
                         (1f - 2f * transition.value.y).coerceIn(0f, 1f)
                 },
             iconSize = designSize(20f), discSize = pageWidth * .073f, filled = isFavorite,
-            enabled = !detailVisible && favoritePresent
+            enabled = !detailVisible && favoritePresent,
+            stateLabel = if (isFavorite) "已收藏" else "未收藏",
         )
         PlayerButton(
             PlayerIconType.More, "更多", onMore,
@@ -387,7 +461,8 @@ fun PlayerScreen(
                             (1f - 2f * transition.value.y).coerceIn(0f, 1f)
                     },
                 iconSize = designSize(16f), discSize = designSize(30f),
-                filled = isFavorite, enabled = showLyrics && !queueMounted
+                filled = isFavorite, enabled = showLyrics && !queueMounted,
+                stateLabel = if (isFavorite) "已收藏" else "未收藏",
             )
             PlayerButton(
                 PlayerIconType.More, "更多", onMore,
@@ -499,12 +574,30 @@ fun PlayerScreen(
             PlayerIconType.Queue, "播放队列", onQueue,
             Modifier.offset(pageWidth * .79f - 24.dp, pageHeight * .94f - 24.dp),
             iconSize = designSize(24f), tint = if (queueVisible) Color.White else softWhite,
-            enabled = controlsEnabled, selected = queueVisible
+            enabled = controlsEnabled, selected = queueVisible,
+            stateLabel = queueModeDescription,
         )
+        // Independent overlay: status never reflows the three existing bottom buttons.
+        // It belongs to the queue button's accessible state, not three tiny touch targets.
+        if (queueModeIcons.isNotEmpty()) {
+            Row(
+                Modifier.offset(pageWidth * .79f + designSize(18f), pageHeight * .94f - designSize(7f))
+                    .clearAndSetSemantics { },
+                horizontalArrangement = Arrangement.spacedBy(designSize(2f)),
+            ) {
+                queueModeIcons.forEach { icon ->
+                    PlayerIcon(icon, Modifier.size(designSize(14f)), Color.White.copy(alpha = .86f))
+                }
+            }
+        }
         }
         }
     }
 }
+
+private fun coverPlaybackScale(progress: Float): Float = .84f + .16f * progress.coerceIn(0f, 1f)
+
+private fun coverShadowElevation(progress: Float): Float = 3f + 13f * progress.coerceIn(0f, 1f)
 
 @Composable
 private fun PlayerQualityBadge(
@@ -665,20 +758,27 @@ private fun PlayerButton(
     filled: Boolean = false,
     enabled: Boolean = true,
     selected: Boolean = false,
+    stateLabel: String? = null,
     seekGesture: PlayerSeekGesture? = null,
     discAlpha: () -> Float = { 1f }
 ) {
     val interaction = remember { MutableInteractionSource() }
     val menuAnchor = rememberMenuAnchor()
+    val view = LocalView.current
+    val scope = rememberCoroutineScope()
+    val favoritePulse = if (icon == PlayerIconType.Star) remember { Animatable(1f) } else null
     val opensMenu = icon == PlayerIconType.More || icon == PlayerIconType.MoreVertical || icon == PlayerIconType.AirPlay
     val pressed by interaction.collectIsPressedAsState()
     val scale by animateFloatAsState(
-        targetValue = if (pressed && enabled) .87f else 1f,
-        animationSpec = spring(dampingRatio = .66f, stiffness = 650f)
+        targetValue = if (pressed && enabled) { if (favoritePulse != null) .94f else .87f } else 1f,
+        animationSpec = spring(dampingRatio = if (favoritePulse != null) 1f else .66f, stiffness = 650f)
     )
     Box(
         modifier.size(touchSize).then(if (opensMenu) menuAnchor.first else Modifier)
-            .semantics { contentDescription = description }
+            .semantics {
+                contentDescription = description
+                stateLabel?.let { stateDescription = it }
+            }
             .then(
                 if (seekGesture != null) Modifier.playerSeekGesture(
                     gesture = seekGesture,
@@ -689,6 +789,19 @@ private fun PlayerButton(
                 ) else if (enabled) Modifier.clickable(
                     interactionSource = interaction, indication = null, role = Role.Button, onClick = {
                         if (opensMenu) menuAnchor.second()
+                        if (favoritePulse != null) {
+                            view.performHapticFeedback(android.view.HapticFeedbackConstants.CLOCK_TICK)
+                            if ((scope.coroutineContext[MotionDurationScale]?.scaleFactor ?: 1f) > 0f) {
+                                scope.launch(start = CoroutineStart.UNDISPATCHED) {
+                                    // A single, restrained impulse, only on an actual tap. State
+                                    // restores and track changes must not bounce or vibrate.
+                                    favoritePulse.animateTo(
+                                        1f, spring(dampingRatio = .85f, stiffness = 650f),
+                                        initialVelocity = (favoritePulse.velocity.coerceAtLeast(0f) + 2.8f).coerceAtMost(3.6f),
+                                    )
+                                }
+                            }
+                        }
                         onClick()
                     }
                 ) else Modifier.clearAndSetSemantics { }
@@ -705,7 +818,10 @@ private fun PlayerButton(
             } else if (discSize > 0.dp) {
                 Box(Modifier.fillMaxSize().graphicsLayer { alpha = discAlpha() }.clip(CircleShape).background(Color.White.copy(alpha = if (pressed) .22f else .12f)))
             }
-            PlayerIcon(icon, Modifier.size(iconSize), tint, filled)
+            PlayerIcon(icon, Modifier.size(iconSize).graphicsLayer {
+                scaleX = favoritePulse?.value ?: 1f
+                scaleY = scaleX
+            }, tint, filled)
         }
     }
 }

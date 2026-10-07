@@ -462,9 +462,9 @@ class OnlineMusicRepository(context: Context) {
             publicText("artist", "singer", "artistName"), audioHost = "")
     }
 
-    suspend fun resolvePlayableTrack(track: Track): Track = withContext(Dispatchers.IO) {
+    suspend fun resolvePlayableTrack(track: Track, requestedQuality: OnlinePlaybackQuality? = null): Track = withContext(Dispatchers.IO) {
         if (!track.isOnline) return@withContext track
-        val quality = OnlinePlaybackQuality.fromLevel(appPreferences.getString(AppPreferences.KEY_ONLINE_QUALITY, "standard"))
+        val quality = requestedQuality ?: OnlinePlaybackQuality.fromLevel(appPreferences.getString(AppPreferences.KEY_ONLINE_QUALITY, "standard"))
             ?: throw IOException("在线播放音质设置无效，请重新选择；未自动降低音质")
         val source = track.sourceId?.trim()?.lowercase(Locale.ROOT)
         val id = track.sourceTrackId?.trim().orEmpty()
@@ -546,12 +546,14 @@ class OnlineMusicRepository(context: Context) {
     /** Public metadata only. The caller owns the original stableKey; no title-based cross-source matching. */
     suspend fun resolveMetadata(
         track: Track,
+        includeArtwork: Boolean = true,
+        includeLyrics: Boolean = true,
         onArtworkReady: suspend (Uri) -> Unit = {},
     ): Track = withContext(Dispatchers.IO) {
         if (!track.isOnline || !validId(track.sourceId.orEmpty(), track.sourceTrackId.orEmpty())) return@withContext track
         coroutineScope {
-            val cover = async { resolveArtwork(track).artworkUri }
-            val lyrics = async { optionalMetadata { resolveLyrics(track) } }
+            val cover = async { if (includeArtwork) resolveArtwork(track).artworkUri else track.artworkUri }
+            val lyrics = async { if (includeLyrics) optionalMetadata { resolveLyrics(track) } else track.lines }
             val artworkUri = cover.await() ?: track.artworkUri
             coroutineContext.ensureActive()
             // Runs on IO; callers merge only this field into the current stableKey on Main.
@@ -729,38 +731,54 @@ class OnlineMusicRepository(context: Context) {
         preferences.edit().putString("saved_tracks", array.toString()).apply()
     }
 
-    suspend fun download(track: Track): Long = withContext(Dispatchers.IO) {
-        val source = builtInSources.firstOrNull { it.id == track.sourceId }
-        require(source?.supportsDownload == true) { "该来源尚未提供可用的下载地址" }
-        val playable = resolvePlayableTrack(track)
+    /** Resolves only this track/level; artwork and lyrics must not block quality selection. */
+    internal suspend fun prepareDownload(track: Track, quality: OnlinePlaybackQuality): PreparedMusicDownload =
+        withContext(Dispatchers.IO) {
+            val source = sourcesFromConfig(preferences.getString("source_config", null))
+                .firstOrNull { it.id == track.sourceId }
+            if (source?.enabled != true || !source.supportsDownload) throw IOException("当前音源未开放下载")
+            requireOnlineQuality(source, quality)
+            val playable = resolvePlayableTrack(track, quality)
+            val headers = OnlineHttp.downloadHeaders(playable.uri.toString(), playable.requestHeaders)
+            val mime = DownloadPreviewRules.declaredMime(headers.mimeType) ?: playable.mimeType
+            val spec = MusicDownloadRules.fileSpec("音乐", mime, playable.uri.lastPathSegment.orEmpty())
+            if (!spec.mimeType.startsWith("audio/") && spec.mimeType != "video/mp4") {
+                throw IOException("来源未返回音频文件，请选择其他音质或稍后重试")
+            }
+            if (quality in setOf(OnlinePlaybackQuality.Lossless, OnlinePlaybackQuality.HiRes) &&
+                spec.extension in setOf("mp3", "aac", "opus", "amr")) {
+                throw IOException("来源返回有损格式，与所选音质不符；未自动降低音质")
+            }
+            coroutineContext.ensureActive()
+            PreparedMusicDownload(track, playable.copy(mimeType = spec.mimeType,
+                sizeBytes = headers.totalBytes ?: 0L), quality, spec.extension.uppercase(Locale.ROOT), headers.totalBytes)
+        }
+
+    suspend fun download(
+        track: Track,
+        quality: OnlinePlaybackQuality = OnlinePlaybackQuality.fromLevel(
+            appPreferences.getString(AppPreferences.KEY_DOWNLOAD_QUALITY, "standard")) ?: OnlinePlaybackQuality.Standard,
+        embedCover: Boolean = appPreferences.getBoolean(AppPreferences.KEY_DOWNLOAD_EMBED_COVER, true),
+        embedLyrics: Boolean = appPreferences.getBoolean(AppPreferences.KEY_DOWNLOAD_EMBED_LYRICS, true),
+    ): Long = download(prepareDownload(track, quality), embedCover, embedLyrics)
+
+    /** Do not resolve again here: preview, confirmation and enqueue share one URL and one level. */
+    internal suspend fun download(
+        prepared: PreparedMusicDownload,
+        embedCover: Boolean = appPreferences.getBoolean(AppPreferences.KEY_DOWNLOAD_EMBED_COVER, true),
+        embedLyrics: Boolean = appPreferences.getBoolean(AppPreferences.KEY_DOWNLOAD_EMBED_LYRICS, true),
+    ): Long = withContext(Dispatchers.IO) {
+        val track = prepared.track
+        val playable = prepared.playable
         OnlineHttp.validateUrl(playable.uri.toString())
         val safeName = "${track.artist} - ${track.title}".replace(Regex("[\\p{Cntrl}/\\\\:*?\"<>|]"), "_").take(100)
-        val extension = when (playable.mimeType?.lowercase(Locale.ROOT)) {
-            "audio/flac", "audio/x-flac" -> "flac"
-            "audio/mp4", "audio/aac", "audio/x-m4a" -> "m4a"
-            "audio/ogg" -> "ogg"
-            else -> "mp3"
-        }
+        val spec = MusicDownloadRules.fileSpec(safeName, playable.mimeType, playable.uri.lastPathSegment.orEmpty())
         coroutineContext.ensureActive()
-        val audioId = MusicDownloads.enqueue(context, playable, "$safeName.$extension")
-        if (appPreferences.getBoolean(AppPreferences.KEY_DOWNLOAD_COMPANION, false)) {
-            val metadata = resolveMetadata(track)
-            metadata.artworkUri?.let { cover ->
-                if (cover.scheme == "http" || cover.scheme == "https") runCatching {
-                    MusicDownloads.enqueue(context, Track(0L, cover, "$safeName 封面", "", "", 0L, mimeType = "image/jpeg"), "$safeName.jpg")
-                }
-            }
-            if (metadata.performanceLines.isNotEmpty()) {
-                val lrc = metadata.performanceLines.joinToString("\n") { line ->
-                    val minutes = line.startMs / 60_000L
-                    val seconds = (line.startMs % 60_000L) / 1_000L
-                    val millis = line.startMs % 1_000L
-                    "[${minutes}:${seconds.toString().padStart(2, '0')}.${millis.toString().padStart(3, '0')}]${line.text}"
-                }
-                MusicDownloads.writeTextCompanion(context, lrc, "$safeName.lrc", "text/plain")
-            }
-        }
-        audioId
+        val metadata = if (embedCover || embedLyrics) resolveMetadata(track,
+            includeArtwork = embedCover, includeLyrics = embedLyrics) else track
+        coroutineContext.ensureActive()
+        MusicDownloads.enqueue(context, playable.copy(artworkUri = metadata.artworkUri, lines = metadata.lines),
+            "${spec.stem}.${spec.extension}", MusicDownloads.Options(embedCover, embedLyrics, prepared.quality.label))
     }
 
     private fun cleanText(text: String): String = Html.fromHtml(text, Html.FROM_HTML_MODE_LEGACY).toString()
@@ -818,6 +836,74 @@ internal object OnlineHttp {
 
     suspend fun post(value: String, body: String, headers: Map<String, String> = emptyMap()): String =
         request(value, headers, 1024 * 1024, body)
+
+    /** Header-only preflight. Never open/read the audio stream, including when Range is ignored. */
+    suspend fun downloadHeaders(value: String, headers: Map<String, String>): DownloadResponseHeaders =
+        suspendCancellableCoroutine { continuation ->
+            val active = AtomicReference<HttpURLConnection?>()
+            val task = CoroutineScope(continuation.context).launch(Dispatchers.IO) {
+                try {
+                    val result = try {
+                        performDownloadHeaders(value, headers, "HEAD", active)
+                    } catch (failure: SourceHttpException) {
+                        // A denied/expired/limited link is not a reason to try a different method or host.
+                        if (failure.status !in setOf(405, 501)) throw failure
+                        performDownloadHeaders(value, headers, "GET", active)
+                    }
+                    if (continuation.isActive) continuation.resume(result)
+                } catch (cancelled: CancellationException) {
+                    continuation.cancel(cancelled)
+                } catch (failure: Exception) {
+                    val safe = if (failure is SourceHttpException) failure else
+                        IOException("无法检查下载文件，请稍后重试")
+                    if (continuation.isActive) continuation.resumeWithException(safe)
+                }
+            }
+            continuation.invokeOnCancellation {
+                task.cancel()
+                runCatching { active.getAndSet(null)?.disconnect() }
+            }
+        }
+
+    private suspend fun performDownloadHeaders(value: String, headers: Map<String, String>, method: String,
+                                              active: AtomicReference<HttpURLConnection?>): DownloadResponseHeaders {
+        var url = validateUrl(value)
+        repeat(4) {
+            coroutineContext.ensureActive()
+            val connection = (url.openConnection() as HttpURLConnection).apply {
+                connectTimeout = 8_000
+                readTimeout = 8_000
+                instanceFollowRedirects = false
+                requestMethod = method
+                setRequestProperty("User-Agent", "Mozilla/5.0 (Linux; Android) RushiMusic")
+                setRequestProperty("Accept", "audio/*,application/octet-stream;q=0.9,*/*;q=0.5")
+                val allowed = setOf("user-agent", "referer", "origin", "accept")
+                headers.forEach { (key, header) ->
+                    if (key.lowercase(Locale.ROOT) in allowed) setRequestProperty(key, header)
+                }
+                setRequestProperty("Accept-Encoding", "identity")
+                if (method == "GET") setRequestProperty("Range", "bytes=0-0")
+            }
+            active.set(connection)
+            try {
+                coroutineContext.ensureActive()
+                val status = connection.responseCode
+                if (status in listOf(301, 302, 303, 307, 308)) {
+                    val location = connection.getHeaderField("Location") ?: throw IOException("音源重定向缺少地址")
+                    url = validateUrl(URL(url, location).toString())
+                    return@repeat
+                }
+                if (status !in 200..299) throw SourceHttpException(status)
+                coroutineContext.ensureActive()
+                return DownloadResponseHeaders(connection.contentType, DownloadPreviewRules.totalBytes(status,
+                    connection.contentLengthLong, connection.getHeaderField("Content-Range"), connection.contentEncoding))
+            } finally {
+                active.compareAndSet(connection, null)
+                connection.disconnect()
+            }
+        }
+        throw IOException("音源重定向次数过多")
+    }
 
     private suspend fun request(value: String, headers: Map<String, String>, maxBytes: Int, body: String?): String =
         suspendCancellableCoroutine { continuation ->
